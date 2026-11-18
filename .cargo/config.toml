@@ -1,0 +1,6 @@
+[term]
+quiet = true
+
+[alias]
+verify = ["run", "--locked", "-p", "xtask", "--", "verify"]
+limits = ["run", "--locked", "-p", "xtask", "--", "limits"]
