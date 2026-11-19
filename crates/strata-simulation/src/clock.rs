@@ -2,32 +2,7 @@ use std::time::Duration;
 
 use strata_globe::WorldEpoch;
 
-use crate::SimulationError;
-
-const TICKS_PER_SECOND: u64 = 20;
-const MILLIS_PER_TICK: u64 = 1000 / TICKS_PER_SECOND;
-
-/// Wall duration of one game tick at the normal pace.
-pub const TICK_DURATION: Duration = Duration::from_millis(MILLIS_PER_TICK);
-
-/// Elapsed game time in whole ticks since the start of the world.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct GameTime(pub(crate) u64);
-
-impl GameTime {
-    /// Elapsed whole game ticks.
-    #[must_use]
-    pub const fn ticks(self) -> u64 {
-        self.0
-    }
-
-    /// Elapsed game duration at the tick boundary.
-    #[must_use]
-    pub fn elapsed(self) -> Duration {
-        Duration::from_secs(self.0 / TICKS_PER_SECOND)
-            + Duration::from_millis(self.0 % TICKS_PER_SECOND * MILLIS_PER_TICK)
-    }
-}
+use crate::{GameDuration, GameTime, SimulationError, TICK_DURATION};
 
 /// Contiguous due ticks in the range `(start, end]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +23,12 @@ impl TickInterval {
     #[must_use]
     pub const fn end(self) -> GameTime {
         self.end
+    }
+
+    /// Whether a deadline on this timeline is after start and at or before end.
+    #[must_use]
+    pub fn contains(self, deadline: GameTime) -> bool {
+        self.start < deadline && deadline <= self.end
     }
 }
 
@@ -78,9 +59,12 @@ impl WallPacer {
         if running {
             let tick_ns = TICK_DURATION.as_nanos();
             let total_ns = delta.as_nanos() + self.remainder_ns;
-            let target = u128::from(self.target.0) + total_ns / tick_ns;
-            self.target =
-                GameTime(u64::try_from(target).map_err(|_| SimulationError::TickOverflow)?);
+            let ticks =
+                u64::try_from(total_ns / tick_ns).map_err(|_| SimulationError::TickOverflow)?;
+            self.target = self
+                .target
+                .checked_add(GameDuration(ticks))
+                .map_err(|_| SimulationError::TickOverflow)?;
             self.remainder_ns = total_ns % tick_ns;
         }
         self.last_wall = wall_now;

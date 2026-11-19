@@ -3,7 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use strata_globe::{EcefMeters, GlobeSnapshot, WorldEpoch};
-use strata_simulation::{ClockStatus, Simulation, SimulationError, TICK_DURATION};
+use strata_simulation::{ClockStatus, GameDuration, Simulation, SimulationError, TICK_DURATION};
 
 #[test]
 fn uneven_wall_samples_keep_every_nanosecond() -> Result<(), SimulationError> {
@@ -139,6 +139,15 @@ fn a_quadrillion_empty_ticks_use_one_shared_world_publication() -> Result<(), Si
         .pending_interval()
         .ok_or(SimulationError::InvalidConfirmation)?;
     assert_eq!(interval.end().ticks(), 1_000_000_000_000_000);
+    assert!(!interval.contains(interval.start()));
+    assert!(interval.contains(interval.end()));
+    assert_eq!(
+        interval
+            .end()
+            .checked_duration_since(interval.start())
+            .map(GameDuration::as_duration),
+        Ok(wall)
+    );
     simulation.confirm(interval, None)?;
     let latest = reader.latest();
     assert_eq!(latest.confirmed_time().elapsed(), wall);
