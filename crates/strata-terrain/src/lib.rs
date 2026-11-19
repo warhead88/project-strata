@@ -17,6 +17,17 @@ pub mod macro_cache;
 mod macro_climate;
 mod macro_mipmap;
 pub mod noise;
+pub mod patches;
+mod patches_index;
+mod patches_spatial;
+mod patches_validate;
+pub mod query;
+mod site_assessment;
+pub mod strata;
+mod strata_derive;
+mod strata_layers;
+mod strata_minerals;
+pub mod terrain_config;
 pub mod terrain_world;
 
 pub use climate::{Biome, ClimateSample, classify_biome, surface_albedo_rgb};
@@ -35,4 +46,11 @@ pub use hydrology::{
 };
 pub use macro_cache::{DEFAULT_MACRO_RESOLUTION, MacroCell};
 pub use noise::{fbm3, noise3, ridged_fbm3};
-pub use terrain_world::{DEFAULT_EARTH_SEED, TerrainConfig, TerrainWorld};
+pub use patches::{PatchId, PatchReceipt, TerrainPatch, TerrainPatchKind};
+pub use query::{GeographicTags, RenderVertexSample, SiteAssessment, TerrainSample};
+pub use strata::{
+    BedrockKind, GeologyProvince, MAX_STRATA_DEPTH_M, MAX_STRATA_LAYERS, MineralPotential,
+    StrataColumn, StratumLayer, SurfaceMaterial,
+};
+pub use terrain_config::{DEFAULT_EARTH_SEED, TerrainConfig};
+pub use terrain_world::TerrainWorld;

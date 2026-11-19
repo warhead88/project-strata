@@ -2,7 +2,9 @@ use std::fmt;
 
 use strata_globe::GlobeError;
 
-/// Errors returned by terrain configuration, DEM validation, and hydrology construction.
+use crate::patches::PatchId;
+
+/// Errors returned by terrain configuration, DEM validation, hydrology, patches, and site queries.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TerrainError {
     /// Macro cache resolution must be a power of two in `16..=512`.
@@ -40,6 +42,21 @@ pub enum TerrainError {
         /// Validation failure reason.
         reason: &'static str,
     },
+    /// A terrain patch parameter failed validation.
+    InvalidPatch {
+        /// Validation failure reason.
+        reason: &'static str,
+    },
+    /// Requested terrain patch identifier does not exist.
+    PatchNotFound {
+        /// Missing patch identifier.
+        id: PatchId,
+    },
+    /// Site assessment radius was non-finite or non-positive.
+    InvalidSiteRadius {
+        /// Rejected assessment radius in meters.
+        radius_m: f64,
+    },
     /// Underlying [`GlobeError`] propagated from `strata-globe`.
     Globe(GlobeError),
 }
@@ -76,6 +93,18 @@ impl fmt::Display for TerrainError {
             }
             Self::InvalidRiverWaypoints { name, reason } => {
                 write!(f, "invalid river '{name}': {reason}")
+            }
+            Self::InvalidPatch { reason } => {
+                write!(f, "invalid terrain patch: {reason}")
+            }
+            Self::PatchNotFound { id } => {
+                write!(f, "terrain patch {} not found", id.0)
+            }
+            Self::InvalidSiteRadius { radius_m } => {
+                write!(
+                    f,
+                    "invalid site assessment radius {radius_m} m: must be finite and > 0"
+                )
             }
             Self::Globe(err) => write!(f, "globe error: {err}"),
         }

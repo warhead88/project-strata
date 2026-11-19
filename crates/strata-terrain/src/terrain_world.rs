@@ -3,104 +3,21 @@ use strata_globe::{EcefMeters, ElevationRange, ElevationSampler, PlanetSpec, Til
 use crate::climate::{
     Biome, ClimateSample, classify_biome, compute_climate_sample, surface_albedo_rgb,
 };
-use crate::dem::DemGrid;
-use crate::earth_geography::TerrainSource;
 use crate::error::TerrainError;
-use crate::hydrology::{BathymetryZone, LakeDef, RiverDef, WaterSample, bathymetry_zone};
+use crate::hydrology::{
+    BathymetryZone, LakeDef, RiverDef, WaterBodyKind, WaterSample, bathymetry_zone,
+};
 use crate::hydrology_builder::build_hydrology_index;
 use crate::hydrology_index::HydrologyIndex;
-use crate::macro_cache::{
-    CubeMacroCache, DEFAULT_MACRO_RESOLUTION, MacroCell, micro_detail_offset,
-};
+use crate::macro_cache::{CubeMacroCache, MacroCell, micro_detail_offset};
+use crate::patches::{PatchId, PatchLayer, PatchReceipt, TerrainPatch, TerrainPatchKind};
+use crate::query::{RenderVertexSample, SiteAssessment, TerrainSample, compute_slope_and_aspect};
+use crate::site_assessment::assess_site_impl;
+use crate::strata::{GeologyProvince, StrataColumn, StratumLayer};
+use crate::strata_derive::{derive_strata_column, derive_surface_material};
+use crate::terrain_config::{DEFAULT_EARTH_SEED, TerrainConfig};
 
-/// Default seed for [`TerrainWorld::earth_default`].
-pub const DEFAULT_EARTH_SEED: u64 = 0x5354_5241_5441_3031;
-
-/// Configuration for constructing a [`TerrainWorld`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct TerrainConfig {
-    source: TerrainSource,
-    planet: PlanetSpec,
-    macro_resolution: u32,
-}
-
-impl TerrainConfig {
-    /// Creates an Earth-geography configuration with `seed`, [`PlanetSpec::earth`],
-    /// and [`DEFAULT_MACRO_RESOLUTION`].
-    #[must_use]
-    pub fn earth(seed: u64) -> Self {
-        Self {
-            source: TerrainSource::Earth { seed },
-            planet: PlanetSpec::earth(),
-            macro_resolution: DEFAULT_MACRO_RESOLUTION,
-        }
-    }
-
-    /// Creates a seed-driven procedural planet configuration with [`PlanetSpec::earth`]
-    /// and [`DEFAULT_MACRO_RESOLUTION`].
-    #[must_use]
-    pub fn procedural(seed: u64) -> Self {
-        Self {
-            source: TerrainSource::Procedural { seed },
-            planet: PlanetSpec::earth(),
-            macro_resolution: DEFAULT_MACRO_RESOLUTION,
-        }
-    }
-
-    /// Creates a configuration backed by an imported equirectangular [`DemGrid`].
-    #[must_use]
-    pub fn from_dem(grid: DemGrid, seed: u64) -> Self {
-        Self {
-            source: TerrainSource::Dem { grid, seed },
-            planet: PlanetSpec::earth(),
-            macro_resolution: DEFAULT_MACRO_RESOLUTION,
-        }
-    }
-
-    /// Sets the target [`PlanetSpec`].
-    #[must_use]
-    pub const fn with_planet(mut self, planet: PlanetSpec) -> Self {
-        self.planet = planet;
-        self
-    }
-
-    /// Sets the per-face macro cache cell resolution (must be a power of two in `16..=512`).
-    #[must_use]
-    pub const fn with_macro_resolution(mut self, resolution: u32) -> Self {
-        self.macro_resolution = resolution;
-        self
-    }
-
-    /// Configured terrain source.
-    #[must_use]
-    pub const fn source(&self) -> &TerrainSource {
-        &self.source
-    }
-
-    /// Configured [`PlanetSpec`].
-    #[must_use]
-    pub const fn planet(&self) -> PlanetSpec {
-        self.planet
-    }
-
-    /// Configured per-face macro cache resolution.
-    #[must_use]
-    pub const fn macro_resolution(&self) -> u32 {
-        self.macro_resolution
-    }
-
-    /// Deterministic seed associated with this configuration.
-    #[must_use]
-    pub const fn seed(&self) -> u64 {
-        match &self.source {
-            TerrainSource::Earth { seed }
-            | TerrainSource::Procedural { seed }
-            | TerrainSource::Dem { seed, .. } => *seed,
-        }
-    }
-}
-
-/// Complete planetary terrain, hydrology, climate, and biome world implementing
+/// Complete planetary terrain, hydrology, climate, geology, and patch world implementing
 /// [`strata_globe::ElevationSampler`] with `O(1)` zero-allocation point queries.
 #[derive(Debug, Clone)]
 pub struct TerrainWorld {
@@ -108,6 +25,7 @@ pub struct TerrainWorld {
     seed: u64,
     hydrology: HydrologyIndex,
     macro_cache: CubeMacroCache,
+    patches: PatchLayer,
 }
 
 impl TerrainWorld {
@@ -133,6 +51,7 @@ impl TerrainWorld {
             seed,
             hydrology,
             macro_cache,
+            patches: PatchLayer::new(),
         })
     }
 
@@ -170,6 +89,67 @@ impl TerrainWorld {
         self.macro_cache.resolution()
     }
 
+    /// Monotonic terrain modification revision (starts at `0`, increments on apply/remove).
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.patches.revision()
+    }
+
+    /// All active terrain patches in application order.
+    #[must_use]
+    pub fn patches(&self) -> &[TerrainPatch] {
+        self.patches.patches()
+    }
+
+    /// Validates and applies a local terrain modification or subsurface void patch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerrainError`] if vectors are non-finite/zero, radii/widths are non-positive,
+    /// corridors are degenerate, or void depth bounds are invalid.
+    pub fn apply_patch(&mut self, kind: TerrainPatchKind) -> Result<PatchReceipt, TerrainError> {
+        let radius_m = self.config.planet.radius_meters();
+        let portal_elev = match kind {
+            TerrainPatchKind::UndergroundVoid {
+                portal_surface_unit: Some(portal),
+                ..
+            } => portal
+                .normalized()
+                .map_or(0.0, |u| self.sample_elevation(u)),
+            _ => 0.0,
+        };
+        self.patches.apply_patch(kind, radius_m, |_| portal_elev)
+    }
+
+    /// Removes a previously applied patch by [`PatchId`], restoring baseline terrain and updating bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerrainError::PatchNotFound`] if `id` is not active.
+    pub fn remove_patch(&mut self, id: PatchId) -> Result<PatchReceipt, TerrainError> {
+        self.patches.remove_patch(id)
+    }
+
+    /// Returns the active [`PatchId`] if an underground void encloses `(unit_dir, depth_m)`.
+    #[must_use]
+    pub fn has_underground_void_at(&self, unit_dir: EcefMeters, depth_m: f64) -> Option<PatchId> {
+        let Ok(unit) = unit_dir.normalized() else {
+            return None;
+        };
+        self.patches
+            .has_underground_void_at(unit, self.config.planet.radius_meters(), depth_m)
+    }
+
+    /// Returns `true` if any active underground void underlies `unit_dir`.
+    #[must_use]
+    pub fn has_any_underground_void(&self, unit_dir: EcefMeters) -> bool {
+        let Ok(unit) = unit_dir.normalized() else {
+            return false;
+        };
+        self.patches
+            .has_any_underground_void(unit, self.config.planet.radius_meters())
+    }
+
     /// Evaluates elevation, water body, and cached macro cell in a single `O(1)` zero-allocation pass.
     #[inline]
     fn sample_core(&self, unit_dir: EcefMeters) -> (f64, WaterSample, MacroCell) {
@@ -191,6 +171,9 @@ impl TerrainWorld {
         let micro = micro_detail_offset(unit, f64::from(cell.roughness), self.seed);
         let base_elev = f64::from(cell.macro_elevation_m) + micro;
         let (elev, water) = self.hydrology.carve_and_sample(unit, base_elev);
+        let (elev, water) =
+            self.patches
+                .apply_to_sample(unit, self.config.planet.radius_meters(), elev, water);
         (elev, water, cell)
     }
 
@@ -219,10 +202,111 @@ impl TerrainWorld {
     /// Samples physical-geographic surface albedo RGB `[0.0, 1.0]^3` at `unit_dir` and `slope_sin`.
     #[must_use]
     pub fn sample_surface_rgb(&self, unit_dir: EcefMeters, slope_sin: f64) -> [f32; 3] {
+        self.sample_render_vertex(unit_dir, slope_sin).albedo_rgb
+    }
+
+    /// Samples elevation, surface albedo RGB, and hydrology in one `O(1)` zero-allocation pass.
+    #[must_use]
+    pub fn sample_render_vertex(&self, unit_dir: EcefMeters, slope_sin: f64) -> RenderVertexSample {
         let (elev, water, cell) = self.sample_core(unit_dir);
         let climate = compute_climate_sample(cell, elev, water);
         let biome = classify_biome(elev, water, climate);
-        surface_albedo_rgb(elev, slope_sin, water, climate, biome)
+        let albedo_rgb = surface_albedo_rgb(elev, slope_sin, water, climate, biome);
+        RenderVertexSample {
+            elevation_m: elev,
+            albedo_rgb,
+            water,
+        }
+    }
+
+    /// Samples the stack-allocated vertical [`StrataColumn`] at `unit_dir` (zero heap allocations).
+    #[must_use]
+    pub fn sample_strata_column(&self, unit_dir: EcefMeters) -> StrataColumn {
+        let unit = unit_dir
+            .normalized()
+            .unwrap_or_else(|_| EcefMeters::from_raw(0.0, 0.0, 1.0));
+        let (elev, water, cell) = self.sample_core(unit);
+        let climate = compute_climate_sample(cell, elev, water);
+        let biome = classify_biome(elev, water, climate);
+        let province = GeologyProvince::from_id(cell.geology_province);
+        let (slope_rad, _, _) = compute_slope_and_aspect(self, unit);
+        derive_strata_column(
+            unit,
+            elev,
+            slope_rad.sin(),
+            water,
+            climate,
+            biome,
+            province,
+            self.seed,
+        )
+    }
+
+    /// Samples the [`StratumLayer`] at absolute `elevation_m` below `unit_dir` (zero heap allocations).
+    #[must_use]
+    pub fn sample_stratum_at_elevation(
+        &self,
+        unit_dir: EcefMeters,
+        elevation_m: f64,
+    ) -> StratumLayer {
+        let column = self.sample_strata_column(unit_dir);
+        let surface_elev = self.sample_elevation(unit_dir);
+        let depth_m = if elevation_m.is_finite() {
+            (surface_elev - elevation_m).max(0.0)
+        } else {
+            0.0
+        };
+        *column.layer_at_depth(depth_m)
+    }
+
+    /// Samples the full physical-geographic [`TerrainSample`] at `unit_dir` (zero heap allocations).
+    #[must_use]
+    pub fn sample_terrain(&self, unit_dir: EcefMeters) -> TerrainSample {
+        let unit = unit_dir
+            .normalized()
+            .unwrap_or_else(|_| EcefMeters::from_raw(0.0, 0.0, 1.0));
+        let (elev, water, cell) = self.sample_core(unit);
+        let climate = compute_climate_sample(cell, elev, water);
+        let biome = classify_biome(elev, water, climate);
+        let province = GeologyProvince::from_id(cell.geology_province);
+        let (slope_rad, slope_percent, aspect_rad) = compute_slope_and_aspect(self, unit);
+        let surface_material =
+            derive_surface_material(elev, slope_rad.sin(), water, climate, biome);
+        let permafrost = water.kind == WaterBodyKind::Dry
+            && (climate.mean_temp_c < -1.0 || climate.permafrost_prob > 0.15);
+        let has_underground_void = self
+            .patches
+            .has_any_underground_void(unit, self.config.planet.radius_meters());
+
+        TerrainSample {
+            elevation_m: elev,
+            slope_rad,
+            slope_percent,
+            aspect_rad,
+            roughness: cell.roughness,
+            water,
+            bathymetry: bathymetry_zone(elev),
+            climate,
+            biome,
+            province,
+            surface_material,
+            permafrost,
+            has_underground_void,
+        }
+    }
+
+    /// Evaluates aggregate engineering, hydrology, and geographic metrics within `radius_m`
+    /// of `center_unit` using 25 deterministic concentric-ring samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerrainError`] if `radius_m` is non-finite/non-positive or `center_unit` is invalid.
+    pub fn assess_site(
+        &self,
+        center_unit: EcefMeters,
+        radius_m: f64,
+    ) -> Result<SiteAssessment, TerrainError> {
+        assess_site_impl(self, center_unit, radius_m)
     }
 
     /// Classifies `elevation_m` into a [`BathymetryZone`].
@@ -260,10 +344,12 @@ impl ElevationSampler for TerrainWorld {
     }
 
     fn global_range(&self) -> ElevationRange {
-        self.macro_cache.global_range()
+        self.patches
+            .expand_global_range(self.macro_cache.global_range())
     }
 
     fn tile_range(&self, _planet: PlanetSpec, tile: TileId) -> ElevationRange {
-        self.macro_cache.tile_range(tile)
+        self.patches
+            .expand_tile_range(tile, self.macro_cache.tile_range(tile))
     }
 }
