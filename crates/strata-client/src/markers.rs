@@ -278,7 +278,7 @@ fn format_hud(
     }
     let _ = write!(
         out,
-        "Controls: Wheel/+- Zoom | L-Drag Orbit | R-Drag/WASD Pan | 1-7/Tab Point | P Planet | L 20m | R Sweep"
+        "Controls: Wheel/+-/PgUpDn Zoom-to-Cursor | MMB/WASD/Arrows Pan | RMB/Alt+MMB/Q-E Rotate+Tilt | N/Home/Compass North | 1-7/Tab Point | P/L/R"
     );
     out
 }
