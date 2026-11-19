@@ -229,10 +229,19 @@ fn format_hud(
         render_state.min_lod,
         render_state.max_lod,
     );
+    let blend = cam_state.orbital_blend();
+    let view_mode = if blend >= 0.999 {
+        "Planet (Center)"
+    } else if blend <= 0.001 {
+        "Surface"
+    } else {
+        "Transition"
+    };
     let _ = writeln!(
         out,
-        "Altitude: {:.1} m | Origin Rebases: {} | Sweep: {}",
+        "Altitude: {:.1} m | View: {view_mode} (pitch {:.1} deg) | Rebases: {} | Sweep: {}",
         cam_state.altitude_meters,
+        cam_state.effective_pitch_rad().to_degrees(),
         origin_state.rebase_count,
         if auto_sweep { "ON" } else { "OFF" },
     );

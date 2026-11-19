@@ -7,6 +7,12 @@ pub const MIN_ALTITUDE_METERS: f64 = 20.0;
 /// Maximum orbital altitude factor relative to planet radius (`~20,000 km` on Earth).
 pub const MAX_ALTITUDE_RADIUS_FACTOR: f64 = 3.2;
 
+/// Altitude-to-radius ratio below which full surface-tilted strategy camera applies (`~95 km` on Earth).
+pub const SURFACE_VIEW_ALTITUDE_RATIO: f64 = 0.015;
+
+/// Altitude-to-radius ratio above which camera centers radially on planet center (`~2,867 km` on Earth).
+pub const ORBITAL_VIEW_ALTITUDE_RATIO: f64 = 0.45;
+
 /// Marker component for the primary 3D globe camera.
 #[derive(Component)]
 pub struct GlobeCamera;
@@ -23,9 +29,9 @@ pub struct GlobeCameraState {
     pub altitude_meters: f64,
     /// Target altitude above sphere surface in meters (logarithmically zoomed).
     pub target_altitude_meters: f64,
-    /// Camera azimuth around the local surface normal in radians.
+    /// Camera azimuth around the local surface normal in radians (`0` = North up).
     pub yaw_rad: f64,
-    /// Camera tilt away from nadir (`0` = straight down, `1.25` = oblique horizon).
+    /// Desired local surface tilt away from nadir (`0` = straight down, `1.25` = oblique horizon).
     pub pitch_rad: f64,
     /// Vertical field of view in radians.
     pub fov_y_rad: f64,
@@ -46,7 +52,7 @@ impl GlobeCameraState {
             focus_unit,
             altitude_meters: initial_alt,
             target_altitude_meters: initial_alt,
-            yaw_rad: 0.35,
+            yaw_rad: 0.0,
             pitch_rad: 0.45,
             fov_y_rad: 60.0_f64.to_radians(),
             planet,
@@ -57,6 +63,25 @@ impl GlobeCameraState {
     #[must_use]
     pub fn max_altitude_meters(&self) -> f64 {
         (self.planet.radius_meters() * MAX_ALTITUDE_RADIUS_FACTOR).max(1_000.0)
+    }
+
+    /// Smooth blend factor in `[0.0, 1.0]` between local surface camera (`0.0`)
+    /// and planet-centered radial orbital camera (`1.0`), computed in log-altitude space.
+    #[must_use]
+    pub fn orbital_blend(&self) -> f64 {
+        let r = self.planet.radius_meters();
+        let lo = (r * SURFACE_VIEW_ALTITUDE_RATIO).max(MIN_ALTITUDE_METERS);
+        let hi = (r * ORBITAL_VIEW_ALTITUDE_RATIO).max(lo * 2.0);
+        let alt = self.altitude_meters.max(MIN_ALTITUDE_METERS);
+        let t = ((alt.ln() - lo.ln()) / (hi.ln() - lo.ln())).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// Effective tilt angle in radians after blending smoothly to `0` in orbital view
+    /// so the globe stays centered on planet center while zooming from orbit.
+    #[must_use]
+    pub fn effective_pitch_rad(&self) -> f64 {
+        self.pitch_rad * (1.0 - self.orbital_blend())
     }
 
     /// Surface focus point in `f64` ECEF meters.
@@ -87,14 +112,18 @@ impl GlobeCameraState {
         }
     }
 
-    /// Computes `(eye_ecef, look_target_ecef, up_hint_ecef)` in `f64` with
-    /// pole-safe surface-tangent up alignment.
+    /// Computes `(eye_ecef, look_target_ecef, up_hint_ecef)` in `f64`.
+    ///
+    /// At orbital altitudes (`orbital_blend == 1.0`), `effective_pitch_rad` reaches `0`,
+    /// placing the eye radially along `focus_unit` so the view ray passes directly through
+    /// both the surface focus point and planet center (`EcefMeters::ZERO`). As the camera
+    /// descends toward the surface, tilt smoothly engages for oblique strategy-map viewing.
     #[must_use]
     pub fn compute_pose_f64(&self) -> (EcefMeters, EcefMeters, EcefMeters) {
         let normal = self.focus_unit;
         let (_east, _north, _right, heading) = self.local_tangent_frame();
         let target = self.focus_ecef();
-        let (sin_p, cos_p) = self.pitch_rad.sin_cos();
+        let (sin_p, cos_p) = self.effective_pitch_rad().sin_cos();
 
         let view_back = normal.scale(cos_p) - heading.scale(sin_p);
         let up_hint = normal.scale(sin_p) + heading.scale(cos_p);
@@ -241,6 +270,41 @@ mod tests {
         for _ in 0..20 {
             cam.pan_tangent(0.05, 0.03);
             assert!((cam.focus_unit.norm() - 1.0).abs() <= 1e-12);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn orbital_zoom_centers_on_planet_and_transitions_smoothly_to_surface() -> Result<(), GlobeError>
+    {
+        for planet in [PlanetSpec::earth(), PlanetSpec::with_radius(1_737_400.0)?] {
+            let r = planet.radius_meters();
+            let mut cam = GlobeCameraState::new(planet, EcefMeters::from_raw(1.0, 1.0, 1.0))?;
+            cam.pitch_rad = 0.6;
+
+            // At orbital scale, camera ray points straight through planet center (EcefMeters::ZERO).
+            cam.altitude_meters = r * 2.5;
+            assert!((cam.orbital_blend() - 1.0).abs() <= 1e-12);
+            assert!(cam.effective_pitch_rad().abs() <= 1e-12);
+            let (eye_orb, target_orb, _) = cam.compute_pose_f64();
+            let to_surface = (target_orb - eye_orb).normalized()?;
+            let to_center = (EcefMeters::ZERO - eye_orb).normalized()?;
+            assert!(to_surface.distance_to(to_center) <= 1e-12);
+
+            // Transition is strictly monotonic from orbit down to local ground.
+            let mut prev_blend = 1.0_f64;
+            for step in 0..=30_u32 {
+                let t = f64::from(step) / 30.0;
+                cam.altitude_meters = (r * 2.5).powf(1.0 - t) * MIN_ALTITUDE_METERS.powf(t);
+                let blend = cam.orbital_blend();
+                assert!(blend <= prev_blend + 1e-12);
+                prev_blend = blend;
+            }
+
+            // At local surface scale, full desired strategy pitch is active.
+            cam.altitude_meters = MIN_ALTITUDE_METERS;
+            assert!(cam.orbital_blend().abs() <= 1e-12);
+            assert!((cam.effective_pitch_rad() - cam.pitch_rad).abs() <= 1e-12);
         }
         Ok(())
     }
