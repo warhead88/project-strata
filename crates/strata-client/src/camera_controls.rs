@@ -73,12 +73,14 @@ pub fn handle_camera_input(
     mut motion_events: MessageReader<MouseMotion>,
     world_view: Res<ClientWorldView>,
     terrain: Res<TerrainElevation>,
-    mut render_state: ResMut<GlobeRenderState>,
+    render_state: Option<ResMut<GlobeRenderState>>,
     mut gesture: ResMut<PointerGestureState>,
     mut selected: ResMut<SelectedPointState>,
     mut cam_state: ResMut<GlobeCameraState>,
 ) {
-    if keys.just_pressed(KeyCode::KeyG) {
+    if keys.just_pressed(KeyCode::KeyG)
+        && let Some(mut render_state) = render_state
+    {
         render_state.debug_overlay = !render_state.debug_overlay;
     }
 

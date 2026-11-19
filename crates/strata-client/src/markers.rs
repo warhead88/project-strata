@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 
 use bevy::prelude::*;
 use strata_globe::{ControlPointKind, PointId, ecef_to_tile_uv};
+use strata_simulation::{ClockStatus, SimulationSnapshot};
 use strata_terrain::{Biome, TerrainWorld, WaterBodyKind};
 
 use crate::camera::{GlobeCameraState, OriginState};
@@ -173,7 +174,7 @@ pub fn sync_markers_and_hud(
 
     if let Ok(mut hud_text) = hud_query.single_mut() {
         hud_text.0 = format_hud(
-            snapshot,
+            world_view.frame(),
             selected.active_point(snapshot),
             &cam_state,
             &origin_state,
@@ -230,7 +231,7 @@ fn draw_selected_crosshair(
 }
 
 fn format_hud(
-    snapshot: &strata_globe::GlobeSnapshot,
+    frame: &SimulationSnapshot,
     active: Option<&strata_globe::AuthoritativePoint>,
     cam_state: &GlobeCameraState,
     origin_state: &OriginState,
@@ -238,12 +239,28 @@ fn format_hud(
     terrain_world: Option<&TerrainWorld>,
     auto_sweep: bool,
 ) -> String {
+    let snapshot = frame.world();
+    let time = frame.confirmed_time();
+    let elapsed = time.elapsed();
+    let status = match frame.clock_status() {
+        ClockStatus::Running => "Running",
+        ClockStatus::Pausing => "Pausing",
+        ClockStatus::Paused => "Paused",
+    };
     let mut out = String::with_capacity(640);
+    let _ = writeln!(
+        out,
+        "Game time {:02}:{:02}:{:02}.{:03} | {status} | Space Pause/Resume",
+        elapsed.as_secs() / 3600,
+        elapsed.as_secs() / 60 % 60,
+        elapsed.as_secs() % 60,
+        elapsed.subsec_millis(),
+    );
     let _ = writeln!(
         out,
         "Project Strata | Planet R = {:.0} km | Tick {} | Tiles {} / Cached {} / Pending {} (LOD {}..{})",
         snapshot.planet.radius_meters() / 1_000.0,
-        snapshot.tick,
+        time.ticks(),
         render_state.active_tile_count,
         render_state.cached_tile_count,
         render_state.pending_task_count,

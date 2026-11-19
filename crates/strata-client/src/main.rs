@@ -1,6 +1,7 @@
 mod camera;
 mod camera_controls;
 mod camera_sync;
+mod clock;
 mod compass;
 mod globe_debug;
 mod globe_render;
@@ -14,15 +15,14 @@ mod tile_streaming;
 #[cfg(test)]
 mod terrain_render_tests;
 
-use std::sync::Arc;
-
 use bevy::log::{Level, LogPlugin};
 use bevy::prelude::*;
-use strata_globe::{GlobeSnapshot, SnapshotChannel};
+use strata_globe::GlobeSnapshot;
 
 use crate::camera::{GlobeCameraState, OriginState};
 use crate::camera_controls::{PointerGestureState, handle_camera_input};
 use crate::camera_sync::{setup_camera_and_lighting, update_camera_and_origin};
+use crate::clock::{handle_pause_input, start_clock};
 use crate::compass::{setup_compass_ui, update_compass_ui};
 use crate::globe_debug::draw_cube_face_seams;
 use crate::globe_render::{setup_globe_materials, sync_globe_tiles};
@@ -33,8 +33,14 @@ use crate::terrain::TerrainElevation;
 fn main() -> AppExit {
     let initial_snapshot = GlobeSnapshot::reference_earth();
     let planet = initial_snapshot.planet;
-    let channel = Arc::new(SnapshotChannel::new(initial_snapshot));
-    let world_view = ClientWorldView::new(channel);
+    let (clock_control, reader) = match start_clock(initial_snapshot) {
+        Ok(clock) => clock,
+        Err(error) => {
+            eprintln!("could not start the simulation clock: {error}");
+            return AppExit::error();
+        }
+    };
+    let world_view = ClientWorldView::new(reader);
     let selected = SelectedPointState::default();
     let terrain = TerrainElevation::earth_default();
 
@@ -70,6 +76,7 @@ fn main() -> AppExit {
         )
         .insert_resource(ClearColor(Color::srgb(0.02, 0.03, 0.05)))
         .insert_resource(world_view)
+        .insert_resource(clock_control)
         .insert_resource(selected)
         .insert_resource(cam_state)
         .insert_resource(origin_state)
@@ -88,6 +95,7 @@ fn main() -> AppExit {
             Update,
             (
                 latch_world_snapshot,
+                handle_pause_input,
                 handle_camera_input,
                 update_compass_ui,
                 update_camera_and_origin,

@@ -5006,12 +5006,20 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "strata-globe",
+ "strata-simulation",
  "strata-terrain",
 ]
 
 [[package]]
 name = "strata-globe"
 version = "0.1.0"
+
+[[package]]
+name = "strata-simulation"
+version = "0.1.0"
+dependencies = [
+ "strata-globe",
+]
 
 [[package]]
 name = "strata-terrain"
