@@ -1,37 +1,44 @@
 use std::sync::Arc;
 
 use bevy::prelude::*;
-use strata_globe::{AuthoritativePoint, GlobeSnapshot, PointId, SnapshotChannel};
+use strata_globe::{AuthoritativePoint, GlobeSnapshot, PointId};
+use strata_simulation::{SimulationSnapshot, SnapshotReader};
 
-/// Read-only client view of the latest published simulation [`GlobeSnapshot`].
+/// Read-only client view of the latest published simulation snapshot.
 ///
-/// The client reads an immutable `Arc<GlobeSnapshot>` at the start of the frame
+/// The client latches confirmed time and world together at the start of the frame
 /// and never mutates authoritative `f64` coordinates from `f32` render transforms.
 #[derive(Resource)]
 pub struct ClientWorldView {
-    channel: Arc<SnapshotChannel>,
-    frame_snapshot: Arc<GlobeSnapshot>,
+    reader: SnapshotReader,
+    frame_snapshot: Arc<SimulationSnapshot>,
 }
 
 impl ClientWorldView {
-    /// Creates a [`ClientWorldView`] attached to a published [`SnapshotChannel`].
+    /// Creates a [`ClientWorldView`] subscribed to confirmed simulation state.
     #[must_use]
-    pub fn new(channel: Arc<SnapshotChannel>) -> Self {
-        let frame_snapshot = channel.latest();
+    pub fn new(reader: SnapshotReader) -> Self {
+        let frame_snapshot = reader.latest();
         Self {
-            channel,
+            reader,
             frame_snapshot,
         }
     }
 
     /// Refreshes the per-frame snapshot reference atomically from the channel.
     pub fn latch_latest(&mut self) {
-        self.frame_snapshot = self.channel.latest();
+        self.frame_snapshot = self.reader.latest();
     }
 
-    /// Immutable snapshot latched for the current frame.
+    /// World data latched for the current frame.
     #[must_use]
     pub fn snapshot(&self) -> &GlobeSnapshot {
+        self.frame_snapshot.world()
+    }
+
+    /// Whole publication latched for the current frame.
+    #[must_use]
+    pub fn frame(&self) -> &SimulationSnapshot {
         &self.frame_snapshot
     }
 }
@@ -101,31 +108,43 @@ pub fn latch_world_snapshot(mut world_view: ResMut<ClientWorldView>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use strata_globe::{EcefMeters, PlanetSpec, WorldEpoch};
+    use strata_globe::EcefMeters;
+    use strata_simulation::{ClockStatus, Simulation, SimulationError, TICK_DURATION};
 
     #[test]
-    fn client_view_latches_immutable_snapshot_and_cycles_selection() {
+    fn client_view_latches_clock_and_points_together_and_can_skip_publications()
+    -> Result<(), SimulationError> {
         let initial = GlobeSnapshot::reference_earth();
-        let channel = Arc::new(SnapshotChannel::new(initial));
-        let mut view = ClientWorldView::new(Arc::clone(&channel));
+        let mut sim = Simulation::new(initial.clone());
+        let mut view = ClientWorldView::new(sim.reader());
         let mut sel = SelectedPointState::default();
 
-        assert_eq!(view.snapshot().tick, 0);
         let first_id = sel.selected_id;
         sel.cycle(view.snapshot(), 1);
         assert_ne!(sel.selected_id, first_id);
 
-        // Publish a newer tick without latching yet: client frame view stays on tick 0.
-        let mut next = GlobeSnapshot::reference_for_planet(PlanetSpec::earth());
-        next.epoch = WorldEpoch(2);
-        next.tick = 5;
-        next.points[0].position =
-            EcefMeters::from_raw(0.0, 0.0, PlanetSpec::earth().radius_meters());
-        channel.publish(next);
-        assert_eq!(view.snapshot().tick, 0);
+        sim.toggle_pause(TICK_DURATION * 5)?;
+        let interval = sim
+            .pending_interval()
+            .ok_or(SimulationError::InvalidConfirmation)?;
+        let mut next = initial.clone();
+        let position = EcefMeters::from_raw(0.0, 0.0, next.planet.radius_meters());
+        next.points[0].position = position;
+        sim.confirm(interval, Some(next))?;
+
+        // Both publications arrived while the client held its running frame.
+        assert_eq!(view.frame().clock_status(), ClockStatus::Running);
+        assert_eq!(view.frame().confirmed_time().ticks(), 0);
+        assert_eq!(
+            view.snapshot().points[0].position,
+            initial.points[0].position
+        );
 
         view.latch_latest();
+        assert_eq!(view.frame().clock_status(), ClockStatus::Paused);
+        assert_eq!(view.frame().confirmed_time().elapsed(), TICK_DURATION * 5);
         assert_eq!(view.snapshot().tick, 5);
-        assert_eq!(view.snapshot().epoch, WorldEpoch(2));
+        assert_eq!(view.snapshot().points[0].position, position);
+        Ok(())
     }
 }
