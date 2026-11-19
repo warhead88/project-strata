@@ -5,6 +5,7 @@ mod compass;
 mod globe_render;
 mod markers;
 mod snapshot;
+mod terrain;
 
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use crate::compass::{setup_compass_ui, update_compass_ui};
 use crate::globe_render::{draw_cube_face_seams, setup_globe_materials, sync_globe_tiles};
 use crate::markers::{setup_markers_and_hud, sync_markers_and_hud};
 use crate::snapshot::{ClientWorldView, SelectedPointState, latch_world_snapshot};
+use crate::terrain::TerrainElevation;
 
 fn main() -> AppExit {
     let initial_snapshot = GlobeSnapshot::reference_earth();
@@ -61,6 +63,7 @@ fn main() -> AppExit {
         .insert_resource(selected)
         .insert_resource(cam_state)
         .insert_resource(origin_state)
+        .init_resource::<TerrainElevation>()
         .init_resource::<PointerGestureState>()
         .add_systems(
             Startup,

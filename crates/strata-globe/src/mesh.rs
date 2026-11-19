@@ -1,4 +1,6 @@
 use crate::coords::{EcefMeters, LocalOrigin};
+use crate::cube::face_uv_to_unit;
+use crate::elevation::{ElevationSampler, FlatElevation};
 use crate::lod::CoarserEdges;
 use crate::planet::PlanetSpec;
 use crate::tile::{TileId, TileUv};
@@ -62,17 +64,29 @@ impl TileMeshF64 {
     }
 }
 
-/// Builds an authoritative `f64` sphere-patch mesh for `tile` with watertight
+/// Builds an authoritative `f64` smooth-sphere patch mesh for `tile` with watertight
 /// `coarser_edges` edge stitching.
+#[must_use]
+pub fn build_tile_mesh_f64(
+    planet: PlanetSpec,
+    tile: TileId,
+    coarser_edges: CoarserEdges,
+) -> TileMeshF64 {
+    build_tile_mesh_f64_with_elevation(planet, tile, coarser_edges, &FlatElevation)
+}
+
+/// Builds an authoritative `f64` terrain-displaced tile mesh using `sampler`, keeping
+/// shared vertices bit-identical across intra-face seams, cube edges, and 3-face corners.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "surface unit normals and [0,1] UVs intentionally narrow to f32 for vertex attributes"
 )]
-pub fn build_tile_mesh_f64(
+pub fn build_tile_mesh_f64_with_elevation(
     planet: PlanetSpec,
     tile: TileId,
     coarser_edges: CoarserEdges,
+    sampler: &dyn ElevationSampler,
 ) -> TileMeshF64 {
     let n = planet.grid_segments();
     let stride = (n + 1) as usize;
@@ -83,14 +97,28 @@ pub fn build_tile_mesh_f64(
     let mut uvs = Vec::with_capacity(vertex_count);
 
     let inv_n = 1.0 / f64::from(n);
-    let inv_r = 1.0 / planet.radius_meters();
+    let r_base = planet.radius_meters();
+    let min_r = 1.0_f64.min(r_base * 0.5);
+    let is_flat = sampler.global_range().is_flat();
+    let d_theta = (planet.cell_arc_length_meters(tile.lod) / r_base).clamp(1e-7, 0.05);
+    let (sin_d, cos_d) = d_theta.sin_cos();
 
     for iy in 0..=n {
         let v = f64::from(iy) * inv_n;
         for ix in 0..=n {
             let u = f64::from(ix) * inv_n;
-            let ecef = tile.tile_uv_to_ecef(planet, TileUv::clamped(u, v), 0.0);
-            let normal = ecef.scale(inv_r);
+            let face_uv = tile.tile_uv_to_face_uv(TileUv::clamped(u, v));
+            let unit_dir = face_uv_to_unit(tile.face, face_uv);
+
+            let (ecef, normal) = if is_flat {
+                (unit_dir.scale(r_base), unit_dir)
+            } else {
+                let radius = sample_clamped_radius(r_base, min_r, unit_dir, sampler);
+                let normal =
+                    terrain_normal_canonical(r_base, min_r, unit_dir, sin_d, cos_d, sampler);
+                (unit_dir.scale(radius), normal)
+            };
+
             positions_ecef.push(ecef);
             normals.push([normal.x as f32, normal.y as f32, normal.z as f32]);
             uvs.push([u as f32, v as f32]);
@@ -110,7 +138,7 @@ pub fn build_tile_mesh_f64(
     }
 }
 
-/// Convenience helper building a [`TileRenderMesh`] directly relative to `origin`.
+/// Convenience helper building a smooth-sphere [`TileRenderMesh`] directly relative to `origin`.
 #[must_use]
 pub fn build_tile_render_mesh(
     planet: PlanetSpec,
@@ -118,7 +146,99 @@ pub fn build_tile_render_mesh(
     coarser_edges: CoarserEdges,
     origin: LocalOrigin,
 ) -> TileRenderMesh {
-    build_tile_mesh_f64(planet, tile, coarser_edges).to_render_mesh(origin)
+    build_tile_render_mesh_with_elevation(planet, tile, coarser_edges, origin, &FlatElevation)
+}
+
+/// Convenience helper building a terrain-displaced [`TileRenderMesh`] relative to `origin`.
+#[must_use]
+pub fn build_tile_render_mesh_with_elevation(
+    planet: PlanetSpec,
+    tile: TileId,
+    coarser_edges: CoarserEdges,
+    origin: LocalOrigin,
+    sampler: &dyn ElevationSampler,
+) -> TileRenderMesh {
+    build_tile_mesh_f64_with_elevation(planet, tile, coarser_edges, sampler).to_render_mesh(origin)
+}
+
+#[inline]
+fn sample_clamped_radius(
+    r_base: f64,
+    min_r: f64,
+    unit_dir: EcefMeters,
+    sampler: &dyn ElevationSampler,
+) -> f64 {
+    let elev = sampler.sample_elevation(unit_dir);
+    if elev.is_finite() {
+        (r_base + elev).max(min_r)
+    } else {
+        r_base.max(min_r)
+    }
+}
+
+/// Computes a smooth outward terrain normal using central differences in a canonical
+/// tangent plane depending solely on `unit_dir` and angular cell scale `(sin_d, cos_d)`.
+fn terrain_normal_canonical(
+    r_base: f64,
+    min_r: f64,
+    unit_dir: EcefMeters,
+    sin_d: f64,
+    cos_d: f64,
+    sampler: &dyn ElevationSampler,
+) -> EcefMeters {
+    let (t1, t2) = canonical_tangent_basis(unit_dir);
+    let u1_pos = (unit_dir.scale(cos_d) + t1.scale(sin_d))
+        .normalized()
+        .unwrap_or(unit_dir);
+    let u1_neg = (unit_dir.scale(cos_d) - t1.scale(sin_d))
+        .normalized()
+        .unwrap_or(unit_dir);
+    let u2_pos = (unit_dir.scale(cos_d) + t2.scale(sin_d))
+        .normalized()
+        .unwrap_or(unit_dir);
+    let u2_neg = (unit_dir.scale(cos_d) - t2.scale(sin_d))
+        .normalized()
+        .unwrap_or(unit_dir);
+
+    let p1_pos = u1_pos.scale(sample_clamped_radius(r_base, min_r, u1_pos, sampler));
+    let p1_neg = u1_neg.scale(sample_clamped_radius(r_base, min_r, u1_neg, sampler));
+    let p2_pos = u2_pos.scale(sample_clamped_radius(r_base, min_r, u2_pos, sampler));
+    let p2_neg = u2_neg.scale(sample_clamped_radius(r_base, min_r, u2_neg, sampler));
+
+    let dp1 = p1_pos - p1_neg;
+    let dp2 = p2_pos - p2_neg;
+    let Ok(normal) = dp1.cross(dp2).normalized() else {
+        return unit_dir;
+    };
+    if normal.dot(unit_dir) > 0.0 {
+        normal
+    } else {
+        unit_dir
+    }
+}
+
+/// Deterministic right-handed tangent basis `(t1, t2)` with `t1 x t2 == n`,
+/// independent of cube-face orientation so shared seam/corner vertices match.
+fn canonical_tangent_basis(n: EcefMeters) -> (EcefMeters, EcefMeters) {
+    let ax = n.x.abs();
+    let ay = n.y.abs();
+    let az = n.z.abs();
+    let ref_axis = if ax <= ay && ax <= az {
+        EcefMeters::from_raw(1.0, 0.0, 0.0)
+    } else if ay <= az {
+        EcefMeters::from_raw(0.0, 1.0, 0.0)
+    } else {
+        EcefMeters::from_raw(0.0, 0.0, 1.0)
+    };
+    let t1 = ref_axis
+        .cross(n)
+        .normalized()
+        .unwrap_or(EcefMeters::from_raw(1.0, 0.0, 0.0));
+    let t2 = n
+        .cross(t1)
+        .normalized()
+        .unwrap_or(EcefMeters::from_raw(0.0, 1.0, 0.0));
+    (t1, t2)
 }
 
 /// Generates a watertight, crack-free triangle index buffer for an `n x n` quad grid

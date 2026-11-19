@@ -6,11 +6,12 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use strata_globe::{
     CoarserEdges, EcefMeters, LocalOrigin, LodConfig, PlanetSpec, TileId, TileRenderMesh,
-    build_tile_render_mesh, select_tiles,
+    build_tile_render_mesh_with_elevation, select_tiles_with_elevation,
 };
 
 use crate::camera::{GlobeCameraState, OriginState};
 use crate::snapshot::ClientWorldView;
+use crate::terrain::{TerrainElevation, sample_clamped_elevation};
 
 /// Cached GPU tile mesh and metadata for a single visible [`TileId`].
 struct CachedTile {
@@ -26,6 +27,7 @@ pub struct GlobeRenderState {
     tiles: HashMap<TileId, CachedTile>,
     previously_split: HashSet<TileId>,
     baked_planet: Option<PlanetSpec>,
+    baked_terrain_revision: Option<u64>,
     face_materials: [Handle<StandardMaterial>; 6],
     /// Current LOD configuration used by the client renderer.
     pub lod_config: LodConfig,
@@ -64,6 +66,7 @@ impl GlobeRenderState {
             tiles: HashMap::new(),
             previously_split: HashSet::new(),
             baked_planet: None,
+            baked_terrain_revision: None,
             face_materials,
             lod_config: LodConfig::standard(),
             active_tile_count: 0,
@@ -83,8 +86,9 @@ pub fn setup_globe_materials(
     commands.insert_resource(state);
 }
 
-/// Synchronizes visible Bevy tile meshes with [`strata_globe::select_tiles`] and [`OriginState`].
+/// Synchronizes visible Bevy tile meshes with [`select_tiles_with_elevation`] and [`OriginState`].
 #[expect(
+    clippy::too_many_arguments,
     clippy::needless_pass_by_value,
     reason = "Bevy ECS system parameters require Res<T> by value"
 )]
@@ -92,6 +96,7 @@ pub fn sync_globe_tiles(
     mut commands: Commands,
     windows: Query<&Window>,
     world_view: Res<ClientWorldView>,
+    terrain: Res<TerrainElevation>,
     cam_state: Res<GlobeCameraState>,
     origin_state: Res<OriginState>,
     mut render_state: ResMut<GlobeRenderState>,
@@ -109,21 +114,28 @@ pub fn sync_globe_tiles(
     };
 
     let planet = world_view.snapshot().planet;
-    if render_state.baked_planet != Some(planet) {
+    let terrain_rev = terrain.revision();
+    if render_state.baked_planet != Some(planet)
+        || render_state.baked_terrain_revision != Some(terrain_rev)
+    {
         for (_, removed) in render_state.tiles.drain() {
             commands.entity(removed.entity).despawn();
             meshes.remove(&removed.mesh);
         }
         render_state.previously_split.clear();
         render_state.baked_planet = Some(planet);
+        render_state.baked_terrain_revision = Some(terrain_rev);
     }
 
-    let selection = select_tiles(
+    let Ok(selection) = select_tiles_with_elevation(
         planet,
         &cam_view,
         render_state.lod_config,
         &mut render_state.previously_split,
-    );
+        terrain.sampler(),
+    ) else {
+        return;
+    };
 
     render_state.active_tile_count = selection.tiles.len();
     render_state.min_lod = selection.min_lod_selected;
@@ -151,12 +163,15 @@ pub fn sync_globe_tiles(
 
     // Spawn or rebuild tiles whose edge stitching or LocalOrigin changed.
     let origin = origin_state.origin;
+    let sampler = terrain.sampler();
     for selected in &selection.tiles {
         let tile_id = selected.id;
         let coarser = selected.coarser_edges;
         if let Some(existing) = render_state.tiles.get_mut(&tile_id) {
             if existing.coarser_edges != coarser || existing.baked_origin != origin {
-                let render_mesh = build_tile_render_mesh(planet, tile_id, coarser, origin);
+                let render_mesh = build_tile_render_mesh_with_elevation(
+                    planet, tile_id, coarser, origin, sampler,
+                );
                 if let Some(mut mesh_asset) = meshes.get_mut(&existing.mesh) {
                     *mesh_asset = to_bevy_mesh(render_mesh);
                 }
@@ -164,7 +179,8 @@ pub fn sync_globe_tiles(
                 existing.baked_origin = origin;
             }
         } else {
-            let render_mesh = build_tile_render_mesh(planet, tile_id, coarser, origin);
+            let render_mesh =
+                build_tile_render_mesh_with_elevation(planet, tile_id, coarser, origin, sampler);
             let mesh_handle = meshes.add(to_bevy_mesh(render_mesh));
             let mat_handle = render_state.face_materials[tile_id.face.index()].clone();
             let entity = commands
@@ -197,13 +213,16 @@ pub fn sync_globe_tiles(
 pub fn draw_cube_face_seams(
     mut gizmos: Gizmos,
     world_view: Res<ClientWorldView>,
+    terrain: Res<TerrainElevation>,
     cam_state: Res<GlobeCameraState>,
     origin_state: Res<OriginState>,
 ) {
     let planet = world_view.snapshot().planet;
     let r = planet.radius_meters();
+    let min_r = 1.0_f64.min(r * 0.5);
     let alt = cam_state.altitude_meters.max(1.0);
     let origin = origin_state.origin;
+    let sampler = terrain.sampler();
     let seam_color = Color::srgba(0.95, 0.78, 0.30, 0.55);
 
     let edges: [(EcefMeters, EcefMeters); 12] = [
@@ -289,7 +308,8 @@ pub fn draw_cube_face_seams(
             let t = t_min + (t_max - t_min) * (f64::from(step) * inv_seg);
             let raw = a + dir.scale(t);
             if let Ok(unit) = raw.normalized() {
-                let pt = origin.to_render_vec3(unit.scale(r + lift));
+                let elev = sample_clamped_elevation(planet, unit, sampler);
+                let pt = origin.to_render_vec3(unit.scale((r + elev).max(min_r) + lift));
                 let v = Vec3::new(pt.x, pt.y, pt.z);
                 if let Some(p) = prev {
                     gizmos.line(p, v, seam_color);

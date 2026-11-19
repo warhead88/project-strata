@@ -1,8 +1,66 @@
 use bevy::prelude::*;
 use strata_globe::{EcefMeters, GlobeError, LocalOrigin, RebasePolicy};
 
-use crate::camera::{GlobeCamera, GlobeCameraState, MIN_ALTITUDE_METERS};
+use crate::camera::{
+    GlobeCamera, GlobeCameraState, MIN_ALTITUDE_METERS, NORTH_RESET_DURATION_SECS,
+};
 use crate::snapshot::{ClientWorldView, SelectedPointState};
+use crate::terrain::TerrainElevation;
+
+/// Active smoothstep animation rotating camera heading back to geographic North.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NorthResetAnim {
+    elapsed: f64,
+    duration: f64,
+    prev_smooth: f64,
+    total_angle: f64,
+}
+
+pub(crate) fn start_north_reset_impl(cam: &mut GlobeCameraState) {
+    let Some(north) = cam.geographic_north() else {
+        cam.north_reset = None;
+        return;
+    };
+    let cos_a = cam.heading_unit.dot(north).clamp(-1.0, 1.0);
+    let sin_a = cam.focus_unit.dot(cam.heading_unit.cross(north));
+    let total_angle = sin_a.atan2(cos_a);
+    if total_angle.abs() <= 1e-6 {
+        cam.heading_unit = north;
+        cam.reorthonormalize();
+        cam.north_reset = None;
+    } else {
+        cam.north_reset = Some(NorthResetAnim {
+            elapsed: 0.0,
+            duration: NORTH_RESET_DURATION_SECS,
+            prev_smooth: 0.0,
+            total_angle,
+        });
+    }
+}
+
+pub(crate) fn step_north_reset_impl(cam: &mut GlobeCameraState, dt: f64) {
+    let Some(mut anim) = cam.north_reset else {
+        return;
+    };
+    anim.elapsed = (anim.elapsed + dt.max(0.0)).min(anim.duration);
+    let t = (anim.elapsed / anim.duration).clamp(0.0, 1.0);
+    let smooth = t * t * (3.0 - 2.0 * t);
+    let delta = anim.total_angle * (smooth - anim.prev_smooth);
+    anim.prev_smooth = smooth;
+
+    cam.heading_unit = rotate_around_axis(cam.heading_unit, cam.focus_unit, delta);
+    cam.reorthonormalize();
+
+    if t >= 1.0 {
+        if let Some(north) = cam.geographic_north() {
+            cam.heading_unit = north;
+            cam.reorthonormalize();
+        }
+        cam.north_reset = None;
+    } else {
+        cam.north_reset = Some(anim);
+    }
+}
 
 /// Floating-origin state maintained by the client render layer.
 #[derive(Resource, Debug, Clone)]
@@ -31,7 +89,7 @@ impl OriginState {
 }
 
 /// Computes dynamic `(near, far)` clip distances (`f32`) scaled to camera altitude
-/// and planet radius so both `20 m` local scenes and `20,000 km` orbit views avoid z-fighting.
+/// and planet radius so both `20 m` local scenes and orbital views avoid z-fighting.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
@@ -43,7 +101,8 @@ pub fn dynamic_clip_planes(altitude_meters: f64, radius_meters: f64) -> (f32, f3
     let horizon = ((radius_meters + alt).powi(2) - radius_meters.powi(2))
         .max(0.0)
         .sqrt();
-    let far = horizon.max(alt + 2.5 * radius_meters).max(100_000.0);
+    let min_far = (radius_meters * 4.0).clamp(1_000.0, 100_000.0);
+    let far = horizon.max(alt + 2.5 * radius_meters).max(min_far);
     (near as f32, far as f32)
 }
 
@@ -135,8 +194,9 @@ pub fn setup_camera_and_lighting(
 }
 
 /// Updates logarithmic altitude damping, Zoom-to-Cursor alignment, North reset animation,
-/// [`OriginState`] rebasing, and Bevy [`Camera3d`] transform & clip planes.
+/// terrain ground clearance, [`OriginState`] rebasing, and Bevy [`Camera3d`] transform & clip planes.
 #[expect(
+    clippy::too_many_arguments,
     clippy::needless_pass_by_value,
     reason = "Bevy ECS system parameters require Res<T> by value"
 )]
@@ -144,6 +204,7 @@ pub fn update_camera_and_origin(
     time: Res<Time>,
     windows: Query<&Window>,
     world_view: Res<ClientWorldView>,
+    terrain: Res<TerrainElevation>,
     mut selected: ResMut<SelectedPointState>,
     mut cam_state: ResMut<GlobeCameraState>,
     mut origin_state: ResMut<OriginState>,
@@ -190,12 +251,17 @@ pub fn update_camera_and_origin(
     cam_state.altitude_meters = (log_cur + (log_tgt - log_cur) * blend).exp();
 
     if cam_state.zoom_anchor.is_some() {
-        cam_state.apply_zoom_to_cursor(width_px / height_px, height_px);
+        cam_state.apply_zoom_to_cursor_with_elevation(
+            width_px / height_px,
+            height_px,
+            terrain.sampler(),
+        );
         if (cam_state.altitude_meters.ln() - log_tgt).abs() < 1e-4 {
             cam_state.zoom_anchor = None;
         }
     }
     cam_state.step_north_reset(dt);
+    cam_state.sync_terrain_elevations(terrain.sampler());
 
     let (eye, target, up) = cam_state.compute_pose_f64();
     if origin_state

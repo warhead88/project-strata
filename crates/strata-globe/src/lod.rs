@@ -1,10 +1,14 @@
 use std::collections::HashSet;
 
 use crate::coords::EcefMeters;
-use crate::culling::{TileBounds, is_culled, min_sample_distance};
+use crate::culling::{
+    TileBounds, is_culled, min_sample_distance, tile_geometric_error_meters,
+    validate_selection_inputs,
+};
+use crate::elevation::{ElevationSampler, FlatElevation};
 use crate::error::GlobeError;
 use crate::planet::PlanetSpec;
-use crate::tile::{TileEdge, TileId, TileUv};
+use crate::tile::{TileEdge, TileId};
 
 /// Screen-space error LOD selection and culling configuration.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -185,7 +189,7 @@ pub struct SelectedTile {
 }
 
 /// Complete output of a globe LOD selection pass.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct TileSelection {
     /// Selected leaf tiles sorted deterministically by [`TileId`].
     pub tiles: Vec<SelectedTile>,
@@ -203,24 +207,47 @@ pub fn select_tiles<S: std::hash::BuildHasher + Default>(
     config: LodConfig,
     previously_split: &mut HashSet<TileId, S>,
 ) -> TileSelection {
+    select_tiles_with_elevation(planet, camera, config, previously_split, &FlatElevation)
+        .unwrap_or_default()
+}
+
+/// Selects visible globe tiles against an [`ElevationSampler`], accounting for
+/// displaced relief in tile bounds, horizon culling, sample distances, and SSE.
+///
+/// # Errors
+///
+/// Returns [`GlobeError`] if camera projection/vectors, LOD config, or sampler
+/// global elevation range contain non-finite or invalid parameters.
+pub fn select_tiles_with_elevation<S: std::hash::BuildHasher + Default>(
+    planet: PlanetSpec,
+    camera: &CameraViewF64,
+    config: LodConfig,
+    previously_split: &mut HashSet<TileId, S>,
+    sampler: &dyn ElevationSampler,
+) -> Result<TileSelection, GlobeError> {
+    validate_selection_inputs(camera, config, sampler)?;
+    let global_range = sampler.global_range();
+    let effective_min_lod = config.min_lod.min(planet.max_lod());
+
     let mut leaves = HashSet::new();
     let mut next_split = HashSet::default();
     let mut stack = TileId::roots().to_vec();
     let sse_scale = camera.viewport_height_px / (2.0 * (camera.fov_y_rad * 0.5).tan());
 
     while let Some(tile) = stack.pop() {
-        let bounds = TileBounds::compute(planet, tile);
-        if is_culled(planet, camera, config, &bounds) {
+        let tile_range = sampler.tile_range(planet, tile);
+        let bounds = TileBounds::compute(planet, tile, tile_range);
+        if is_culled(planet, camera, config, &bounds, global_range) {
             continue;
         }
 
-        let min_dist = min_sample_distance(planet, camera.position, tile, bounds.center);
-        let geom_err = planet.lod_geometric_error_meters(tile.lod, config.roughness_ratio);
+        let min_dist = min_sample_distance(planet, camera.position, tile, sampler);
+        let geom_err = tile_geometric_error_meters(planet, tile, config, tile_range);
         let sse_px = (geom_err / min_dist.max(0.25)) * sse_scale;
 
         let should_split = if tile.lod >= planet.max_lod() {
             false
-        } else if tile.lod < config.min_lod.min(planet.max_lod()) {
+        } else if tile.lod < effective_min_lod {
             true
         } else if previously_split.contains(&tile) {
             sse_px >= config.merge_threshold_px
@@ -244,9 +271,9 @@ pub fn select_tiles<S: std::hash::BuildHasher + Default>(
         .copied()
         .map(|id| {
             let coarser_edges = compute_coarser_edges(id, &leaves);
-            let center = id.tile_uv_to_ecef(planet, TileUv::clamped(0.5, 0.5), 0.0);
-            let distance_meters = min_sample_distance(planet, camera.position, id, center);
-            let geom_err = planet.lod_geometric_error_meters(id.lod, config.roughness_ratio);
+            let tile_range = sampler.tile_range(planet, id);
+            let distance_meters = min_sample_distance(planet, camera.position, id, sampler);
+            let geom_err = tile_geometric_error_meters(planet, id, config, tile_range);
             let sse_px = (geom_err / distance_meters.max(0.25)) * sse_scale;
             SelectedTile {
                 id,
@@ -261,11 +288,11 @@ pub fn select_tiles<S: std::hash::BuildHasher + Default>(
     let min_lod_selected = tiles.iter().map(|t| t.id.lod).min().unwrap_or(0);
     let max_lod_selected = tiles.iter().map(|t| t.id.lod).max().unwrap_or(0);
 
-    TileSelection {
+    Ok(TileSelection {
         tiles,
         min_lod_selected,
         max_lod_selected,
-    }
+    })
 }
 
 fn balance_quadtree(leaves: &mut HashSet<TileId>, max_lod: u8) {

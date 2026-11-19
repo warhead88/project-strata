@@ -40,6 +40,13 @@ pub enum GlobeError {
         /// Duplicate point identifier.
         id: u64,
     },
+    /// Elevation range bounds were non-finite or inverted (`min_meters > max_meters`).
+    InvalidElevationRange {
+        /// Minimum elevation in meters.
+        min_meters: f64,
+        /// Maximum elevation in meters.
+        max_meters: f64,
+    },
 }
 
 impl fmt::Display for GlobeError {
@@ -77,6 +84,12 @@ impl fmt::Display for GlobeError {
             }
             Self::DuplicatePointId { id } => {
                 write!(f, "duplicate authoritative point id {id}")
+            }
+            Self::InvalidElevationRange {
+                min_meters,
+                max_meters,
+            } => {
+                write!(f, "invalid elevation range [{min_meters}, {max_meters}] m")
             }
         }
     }

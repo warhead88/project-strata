@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use bevy::prelude::*;
-use strata_globe::{PointId, ecef_to_tile_uv};
+use strata_globe::{ControlPointKind, PointId, ecef_to_tile_uv};
 
 use crate::camera::{GlobeCameraState, OriginState};
 use crate::globe_render::GlobeRenderState;
 use crate::snapshot::{ClientWorldView, SelectedPointState};
+use crate::terrain::{TerrainElevation, sample_clamped_elevation};
 
 /// Marker entity tracking authoritative simulation points in render space.
 #[derive(Resource, Default)]
@@ -75,12 +76,13 @@ pub fn setup_markers_and_hud(
 #[expect(
     clippy::too_many_arguments,
     clippy::needless_pass_by_value,
-    reason = "Bevy presentation system requires Res<T> by value across snapshot, selection, camera, origin, render stats, and gizmos"
+    reason = "Bevy presentation system requires Res<T> by value across snapshot, terrain, selection, camera, origin, render stats, and gizmos"
 )]
 pub fn sync_markers_and_hud(
     mut commands: Commands,
     mut gizmos: Gizmos,
     world_view: Res<ClientWorldView>,
+    terrain: Res<TerrainElevation>,
     selected: Res<SelectedPointState>,
     cam_state: Res<GlobeCameraState>,
     origin_state: Res<OriginState>,
@@ -92,6 +94,10 @@ pub fn sync_markers_and_hud(
     let snapshot = world_view.snapshot();
     let origin = origin_state.origin;
     let (eye_ecef, _, _) = cam_state.compute_pose_f64();
+    let sampler = terrain.sampler();
+    let is_flat = sampler.global_range().is_flat();
+    let r_base = snapshot.planet.radius_meters();
+    let min_r = 1.0_f64.min(r_base * 0.5);
 
     let Some(mesh_handle) = marker_map.marker_mesh.clone() else {
         return;
@@ -119,8 +125,18 @@ pub fn sync_markers_and_hud(
 
     for pt in &snapshot.points {
         let is_selected = pt.id == selected.selected_id;
-        let rel = origin.to_render_vec3(pt.position);
-        let dist = eye_ecef.distance_to(pt.position);
+        let display_pos = if !is_flat
+            && pt.kind != ControlPointKind::WorldEntity
+            && pt.elevation_m == 0.0
+            && let Ok(unit) = pt.position.normalized()
+        {
+            let ground_m = sample_clamped_elevation(snapshot.planet, unit, sampler);
+            unit.scale((r_base + ground_m).max(min_r))
+        } else {
+            pt.position
+        };
+        let rel = origin.to_render_vec3(display_pos);
+        let dist = eye_ecef.distance_to(display_pos);
         #[expect(
             clippy::cast_possible_truncation,
             reason = "marker billboard scale is purely a visual f32 transform scale"
@@ -150,7 +166,7 @@ pub fn sync_markers_and_hud(
         }
 
         if is_selected {
-            draw_selected_crosshair(&mut gizmos, origin, pt.position, dist);
+            draw_selected_crosshair(&mut gizmos, origin, display_pos, dist);
         }
     }
 

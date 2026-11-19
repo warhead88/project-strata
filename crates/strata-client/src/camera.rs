@@ -1,5 +1,11 @@
 use bevy::prelude::*;
-use strata_globe::{CameraViewF64, EcefMeters, GlobeError, PlanetSpec};
+use strata_globe::{
+    CameraViewF64, EcefMeters, ElevationSampler, FlatElevation, GlobeError, PlanetSpec,
+};
+
+use crate::terrain::{
+    apply_zoom_to_cursor_impl, ray_surface_hit_impl, sync_terrain_elevations_impl,
+};
 
 /// Minimum camera altitude above planet surface in meters.
 pub const MIN_ALTITUDE_METERS: f64 = 20.0;
@@ -34,15 +40,6 @@ pub struct ZoomCursorAnchor {
     pub ndc_y: f64,
 }
 
-/// Active smoothstep animation rotating camera heading back to geographic North.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct NorthResetAnim {
-    elapsed: f64,
-    duration: f64,
-    prev_smooth: f64,
-    total_angle: f64,
-}
-
 /// Authoritative `f64` orbital-to-local camera state with a singularity-free
 /// parallel-transported tangent basis `(focus_unit, heading_unit)`.
 ///
@@ -54,10 +51,14 @@ pub struct GlobeCameraState {
     pub focus_unit: EcefMeters,
     /// Unit tangent direction orthogonal to `focus_unit` pointing toward screen-up.
     pub heading_unit: EcefMeters,
-    /// Current damped altitude above sphere surface in meters.
+    /// Current damped altitude above focus surface in meters.
     pub altitude_meters: f64,
-    /// Target altitude above sphere surface in meters (logarithmically zoomed).
+    /// Target altitude above focus surface in meters (logarithmically zoomed).
     pub target_altitude_meters: f64,
+    /// Terrain elevation in meters at `focus_unit` above `planet.radius_meters()`.
+    pub focus_elevation_m: f64,
+    /// Terrain elevation in meters directly beneath the camera eye above `planet.radius_meters()`.
+    pub eye_ground_elevation_m: f64,
     /// Desired local surface tilt away from nadir (`0` = straight down, `MAX_PITCH_RAD` = oblique).
     pub pitch_rad: f64,
     /// Vertical field of view in radians.
@@ -66,7 +67,7 @@ pub struct GlobeCameraState {
     pub planet: PlanetSpec,
     /// Active Zoom-to-Cursor anchor while wheel zoom is damping.
     pub zoom_anchor: Option<ZoomCursorAnchor>,
-    north_reset: Option<NorthResetAnim>,
+    pub(crate) north_reset: Option<NorthResetAnim>,
 }
 
 impl GlobeCameraState {
@@ -84,6 +85,8 @@ impl GlobeCameraState {
             heading_unit,
             altitude_meters: initial_alt,
             target_altitude_meters: initial_alt,
+            focus_elevation_m: 0.0,
+            eye_ground_elevation_m: 0.0,
             pitch_rad: 0.45,
             fov_y_rad: 60.0_f64.to_radians(),
             planet,
@@ -126,10 +129,17 @@ impl GlobeCameraState {
             .unwrap_or(EcefMeters::from_raw(1.0, 0.0, 0.0))
     }
 
-    /// Surface focus point in `f64` ECEF meters.
+    /// Terrain-adjusted surface focus point in `f64` ECEF meters.
     #[must_use]
     pub fn focus_ecef(&self) -> EcefMeters {
-        self.focus_unit.scale(self.planet.radius_meters())
+        let min_r = 1.0_f64.min(self.planet.radius_meters() * 0.5);
+        let r = (self.planet.radius_meters() + self.focus_elevation_m).max(min_r);
+        self.focus_unit.scale(r)
+    }
+
+    /// Updates [`Self::focus_elevation_m`] and [`Self::eye_ground_elevation_m`] from `sampler`.
+    pub fn sync_terrain_elevations(&mut self, sampler: &dyn ElevationSampler) {
+        sync_terrain_elevations_impl(self, sampler);
     }
 
     /// Moves the focus point to frame `point_ecef` with North-up orientation without mutating `point_ecef`.
@@ -188,14 +198,13 @@ impl GlobeCameraState {
         to_unit: EcefMeters,
         max_angle_rad: f64,
     ) -> bool {
-        let dot = from_unit.dot(to_unit).clamp(-1.0, 1.0);
-        let angle = dot.acos();
-        if !angle.is_finite() || angle <= 1e-12 || angle > max_angle_rad {
+        let cross = from_unit.cross(to_unit);
+        let sin_angle = cross.norm();
+        let angle = sin_angle.atan2(from_unit.dot(to_unit));
+        if !angle.is_finite() || angle <= 1e-12 || angle > max_angle_rad || sin_angle <= 1e-15 {
             return false;
         }
-        let Ok(axis) = from_unit.cross(to_unit).normalized() else {
-            return false;
-        };
+        let axis = cross.scale(1.0 / sin_angle);
         self.rotate_frame(axis, angle);
         true
     }
@@ -226,53 +235,16 @@ impl GlobeCameraState {
 
     /// Starts the smooth `0.3 s` animation returning geographic North to screen-up.
     pub fn start_north_reset(&mut self) {
-        let Some(north) = self.geographic_north() else {
-            self.north_reset = None;
-            return;
-        };
-        let cos_a = self.heading_unit.dot(north).clamp(-1.0, 1.0);
-        let sin_a = self.focus_unit.dot(self.heading_unit.cross(north));
-        let total_angle = sin_a.atan2(cos_a);
-        if total_angle.abs() <= 1e-6 {
-            self.heading_unit = north;
-            self.reorthonormalize();
-            self.north_reset = None;
-        } else {
-            self.north_reset = Some(NorthResetAnim {
-                elapsed: 0.0,
-                duration: NORTH_RESET_DURATION_SECS,
-                prev_smooth: 0.0,
-                total_angle,
-            });
-        }
+        start_north_reset_impl(self);
     }
 
     /// Advances an active "Reset to North" animation by `dt` seconds.
     pub fn step_north_reset(&mut self, dt: f64) {
-        let Some(mut anim) = self.north_reset else {
-            return;
-        };
-        anim.elapsed = (anim.elapsed + dt.max(0.0)).min(anim.duration);
-        let t = (anim.elapsed / anim.duration).clamp(0.0, 1.0);
-        let smooth = t * t * (3.0 - 2.0 * t);
-        let delta = anim.total_angle * (smooth - anim.prev_smooth);
-        anim.prev_smooth = smooth;
-
-        self.heading_unit = rotate_around_axis(self.heading_unit, self.focus_unit, delta);
-        self.reorthonormalize();
-
-        if t >= 1.0 {
-            if let Some(north) = self.geographic_north() {
-                self.heading_unit = north;
-                self.reorthonormalize();
-            }
-            self.north_reset = None;
-        } else {
-            self.north_reset = Some(anim);
-        }
+        step_north_reset_impl(self, dt);
     }
 
-    /// Computes `(eye_ecef, look_target_ecef, up_hint_ecef)` in `f64`.
+    /// Computes `(eye_ecef, look_target_ecef, up_hint_ecef)` in `f64`, keeping the eye
+    /// safely above [`Self::eye_ground_elevation_m`].
     #[must_use]
     pub fn compute_pose_f64(&self) -> (EcefMeters, EcefMeters, EcefMeters) {
         let normal = self.focus_unit;
@@ -284,10 +256,13 @@ impl GlobeCameraState {
         let up_hint = normal.scale(sin_p) + heading.scale(cos_p);
         let mut eye = target + view_back.scale(self.altitude_meters);
 
-        let min_r = self.planet.radius_meters() + 5.0;
+        let min_planet_r = 1.0_f64.min(self.planet.radius_meters() * 0.5);
+        let ground_r =
+            (self.planet.radius_meters() + self.eye_ground_elevation_m).max(min_planet_r);
+        let min_eye_r = ground_r + 5.0;
         let eye_r = eye.norm();
-        if eye_r < min_r && eye_r > 0.0 {
-            eye = eye.scale(min_r / eye_r);
+        if eye_r < min_eye_r && eye_r > 0.0 {
+            eye = eye.scale(min_eye_r / eye_r);
         }
 
         (eye, target, up_hint)
@@ -314,8 +289,27 @@ impl GlobeCameraState {
         )
     }
 
-    /// Intersects a screen ray at `(ndc_x, ndc_y)` with the planet sphere, returning
-    /// `(hit_unit_normal, incidence_cos)` where `incidence_cos > 0` faces the camera.
+    /// Intersects a screen ray at `(ndc_x, ndc_y)` with the displaced terrain surface
+    /// defined by `sampler`, returning `(hit_unit_normal, incidence_cos)`.
+    #[must_use]
+    pub fn ray_surface_hit(
+        &self,
+        cam_view: &CameraViewF64,
+        ndc_x: f64,
+        ndc_y: f64,
+        sampler: &dyn ElevationSampler,
+    ) -> Option<(EcefMeters, f64)> {
+        ray_surface_hit_impl(self.planet, cam_view, ndc_x, ndc_y, sampler)
+    }
+
+    /// Intersects a screen ray at `(ndc_x, ndc_y)` with the smooth reference sphere.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "flat-sphere convenience wrapper exercised by tests"
+        )
+    )]
     #[must_use]
     pub fn ray_sphere_hit(
         &self,
@@ -323,45 +317,31 @@ impl GlobeCameraState {
         ndc_x: f64,
         ndc_y: f64,
     ) -> Option<(EcefMeters, f64)> {
-        let half_tan_y = (cam_view.fov_y_rad * 0.5).tan();
-        let half_tan_x = half_tan_y * cam_view.aspect;
-        let ray_dir = (cam_view.forward
-            + cam_view.right.scale(ndc_x * half_tan_x)
-            + cam_view.up.scale(ndc_y * half_tan_y))
-        .normalized()
-        .ok()?;
-        let r = self.planet.radius_meters();
-        let b = cam_view.position.dot(ray_dir);
-        let c = cam_view.position.dot(cam_view.position) - r * r;
-        let disc = b * b - c;
-        if disc < 0.0 {
-            return None;
-        }
-        let t_hit = -b - disc.sqrt();
-        if t_hit <= 0.0 {
-            return None;
-        }
-        let hit_unit = (cam_view.position + ray_dir.scale(t_hit))
-            .normalized()
-            .ok()?;
-        let incidence_cos = (-ray_dir.dot(hit_unit)).max(0.0);
-        Some((hit_unit, incidence_cos))
+        self.ray_surface_hit(cam_view, ndc_x, ndc_y, &FlatElevation)
     }
 
-    /// Re-aligns `(focus_unit, heading_unit)` so the active [`ZoomCursorAnchor`] stays
-    /// pixel-locked under the cursor after an altitude step.
+    /// Re-aligns `(focus_unit, heading_unit)` so [`Self::zoom_anchor`] stays pixel-locked
+    /// on the smooth reference sphere after an altitude step.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "flat-sphere convenience wrapper exercised by tests"
+        )
+    )]
     pub fn apply_zoom_to_cursor(&mut self, aspect: f64, viewport_height_px: f64) {
-        let Some(anchor) = self.zoom_anchor else {
-            return;
-        };
-        let Ok(cam_view) = self.to_camera_view_f64(aspect, viewport_height_px) else {
-            return;
-        };
-        if let Some((after_unit, _)) = self.ray_sphere_hit(&cam_view, anchor.ndc_x, anchor.ndc_y) {
-            let _ = self.rotate_sphere_from_to(after_unit, anchor.world_unit, 0.75);
-        } else {
-            self.zoom_anchor = None;
-        }
+        self.apply_zoom_to_cursor_with_elevation(aspect, viewport_height_px, &FlatElevation);
+    }
+
+    /// Re-aligns `(focus_unit, heading_unit)` so [`Self::zoom_anchor`] stays pixel-locked
+    /// on displaced terrain after an altitude step.
+    pub fn apply_zoom_to_cursor_with_elevation(
+        &mut self,
+        aspect: f64,
+        viewport_height_px: f64,
+        sampler: &dyn ElevationSampler,
+    ) {
+        apply_zoom_to_cursor_impl(self, aspect, viewport_height_px, sampler);
     }
 
     fn rotate_frame(&mut self, unit_axis: EcefMeters, angle_rad: f64) {
@@ -370,7 +350,7 @@ impl GlobeCameraState {
         self.reorthonormalize();
     }
 
-    fn reorthonormalize(&mut self) {
+    pub(crate) fn reorthonormalize(&mut self) {
         if let Ok(n) = self.focus_unit.normalized() {
             self.focus_unit = n;
         }
@@ -389,7 +369,10 @@ impl GlobeCameraState {
 pub use crate::camera_sync::OriginState;
 #[cfg(test)]
 use crate::camera_sync::dynamic_clip_planes;
-use crate::camera_sync::{initial_north_tangent, rotate_around_axis};
+use crate::camera_sync::{
+    NorthResetAnim, initial_north_tangent, rotate_around_axis, start_north_reset_impl,
+    step_north_reset_impl,
+};
 
 #[cfg(test)]
 #[path = "camera_tests.rs"]

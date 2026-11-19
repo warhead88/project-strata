@@ -3,6 +3,7 @@ use bevy::prelude::*;
 
 use crate::camera::{GlobeCameraState, MIN_ALTITUDE_METERS, ZoomCursorAnchor};
 use crate::snapshot::{ClientWorldView, SelectedPointState};
+use crate::terrain::TerrainElevation;
 
 /// Minimum cursor travel in pixels before RMB drag starts rotating/tilting the camera,
 /// preserving crisp RMB clicks for issuing strategy orders.
@@ -69,6 +70,7 @@ pub fn handle_camera_input(
     mut wheel_events: MessageReader<MouseWheel>,
     mut motion_events: MessageReader<MouseMotion>,
     world_view: Res<ClientWorldView>,
+    terrain: Res<TerrainElevation>,
     mut gesture: ResMut<PointerGestureState>,
     mut selected: ResMut<SelectedPointState>,
     mut cam_state: ResMut<GlobeCameraState>,
@@ -94,6 +96,7 @@ pub fn handle_camera_input(
         &keys,
         &mut wheel_events,
         &world_view,
+        &terrain,
         &mut selected,
         &mut cam_state,
     );
@@ -105,6 +108,7 @@ pub fn handle_camera_input(
         &keys,
         &mouse_buttons,
         &mut motion_events,
+        &terrain,
         &mut gesture,
         &mut cam_state,
     );
@@ -112,7 +116,7 @@ pub fn handle_camera_input(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "input helper bundles viewport, keyboard, wheel, snapshot, and camera state"
+    reason = "input helper bundles viewport, keyboard, wheel, snapshot, terrain, and camera state"
 )]
 fn apply_zoom_and_shortcuts(
     dt: f64,
@@ -122,6 +126,7 @@ fn apply_zoom_and_shortcuts(
     keys: &ButtonInput<KeyCode>,
     wheel_events: &mut MessageReader<MouseWheel>,
     world_view: &ClientWorldView,
+    terrain: &TerrainElevation,
     selected: &mut SelectedPointState,
     cam_state: &mut GlobeCameraState,
 ) {
@@ -137,20 +142,20 @@ fn apply_zoom_and_shortcuts(
         };
         wheel_delta += step;
     }
+    wheel_delta = wheel_delta.clamp(-10.0, 10.0);
     if wheel_delta != 0.0 {
         selected.auto_sweep = false;
         if let Some(cursor) = cursor_pos
             && let Ok(cam_view) = cam_state.to_camera_view_f64(aspect, height_px)
         {
             let (ndc_x, ndc_y) = cursor_to_ndc(cursor, width_px, height_px);
-            cam_state.zoom_anchor =
-                cam_state
-                    .ray_sphere_hit(&cam_view, ndc_x, ndc_y)
-                    .map(|(world_unit, _)| ZoomCursorAnchor {
-                        world_unit,
-                        ndc_x,
-                        ndc_y,
-                    });
+            cam_state.zoom_anchor = cam_state
+                .ray_surface_hit(&cam_view, ndc_x, ndc_y, terrain.sampler())
+                .map(|(world_unit, _)| ZoomCursorAnchor {
+                    world_unit,
+                    ndc_x,
+                    ndc_y,
+                });
         } else {
             cam_state.zoom_anchor = None;
         }
@@ -193,6 +198,7 @@ fn apply_zoom_and_shortcuts(
         selected.auto_sweep = false;
         if let Some(pt) = selected.active_point(snapshot) {
             cam_state.focus_on_point(pt.position, Some(MIN_ALTITUDE_METERS));
+            cam_state.sync_terrain_elevations(terrain.sampler());
         } else {
             cam_state.zoom_anchor = None;
             cam_state.target_altitude_meters = MIN_ALTITUDE_METERS;
@@ -225,12 +231,13 @@ fn apply_zoom_and_shortcuts(
     }
     if point_changed && let Some(pt) = selected.active_point(snapshot) {
         cam_state.focus_on_point(pt.position, None);
+        cam_state.sync_terrain_elevations(terrain.sampler());
     }
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "input helper combines viewport, buttons, motion events, gesture state, and camera state"
+    reason = "input helper combines viewport, buttons, motion events, terrain, gesture state, and camera state"
 )]
 fn apply_pan_and_rotation(
     dt: f64,
@@ -240,6 +247,7 @@ fn apply_pan_and_rotation(
     keys: &ButtonInput<KeyCode>,
     mouse_buttons: &ButtonInput<MouseButton>,
     motion_events: &mut MessageReader<MouseMotion>,
+    terrain: &TerrainElevation,
     gesture: &mut PointerGestureState,
     cam_state: &mut GlobeCameraState,
 ) {
@@ -274,9 +282,10 @@ fn apply_pan_and_rotation(
         {
             let prev_ndc = cursor_to_ndc(prev_c, width_px, height_px);
             let curr_ndc = cursor_to_ndc(curr_c, width_px, height_px);
+            let sampler = terrain.sampler();
             if let (Some((prev_unit, prev_cos)), Some((curr_unit, curr_cos))) = (
-                cam_state.ray_sphere_hit(&cam_view, prev_ndc.0, prev_ndc.1),
-                cam_state.ray_sphere_hit(&cam_view, curr_ndc.0, curr_ndc.1),
+                cam_state.ray_surface_hit(&cam_view, prev_ndc.0, prev_ndc.1, sampler),
+                cam_state.ray_surface_hit(&cam_view, curr_ndc.0, curr_ndc.1, sampler),
             ) && prev_cos > 0.08
                 && curr_cos > 0.08
             {
@@ -293,12 +302,12 @@ fn apply_pan_and_rotation(
                 f64::from(drag_delta.y) * 0.0025 * ang_scale,
             );
         }
+        cam_state.sync_terrain_elevations(terrain.sampler());
         gesture.prev_mmb_cursor = cursor_pos;
     } else {
         gesture.prev_mmb_cursor = None;
     }
 
-    // Keyboard Pan: WASD or Arrow keys (without Alt).
     let mut pan_right = 0.0_f64;
     let mut pan_fwd = 0.0_f64;
     if keys.pressed(KeyCode::KeyA) || (!alt_held && keys.pressed(KeyCode::ArrowLeft)) {
@@ -318,9 +327,9 @@ fn apply_pan_and_rotation(
         let ang_speed =
             (cam_state.altitude_meters / cam_state.planet.radius_meters()).clamp(2e-7, 0.8);
         cam_state.pan_tangent(pan_right * ang_speed * dt, pan_fwd * ang_speed * dt);
+        cam_state.sync_terrain_elevations(terrain.sampler());
     }
 
-    // Keyboard own-axis rotation (Q / E) and optional tilt (Alt + Up/Down).
     let mut yaw_dir = 0.0_f64;
     if keys.pressed(KeyCode::KeyQ) {
         yaw_dir -= 1.0;

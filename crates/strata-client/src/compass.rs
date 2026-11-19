@@ -165,6 +165,30 @@ fn on_compass_release(
     }
 }
 
+/// Formats the live compass heading label, returning `"N.Pole"` or `"S.Pole"` when
+/// azimuth is undefined directly at a geographic pole.
+#[must_use]
+pub fn format_compass_heading(cam_state: &GlobeCameraState) -> String {
+    if cam_state.geographic_north().is_none() {
+        return if cam_state.focus_unit.y >= 0.0 {
+            String::from("N.Pole")
+        } else {
+            String::from("S.Pole")
+        };
+    }
+    let north_angle = cam_state.compass_north_angle_rad();
+    if !north_angle.is_finite() {
+        return String::from("0°");
+    }
+    let heading_deg = north_angle.to_degrees().rem_euclid(360.0).round();
+    let display_deg = if heading_deg >= 360.0 {
+        0.0
+    } else {
+        heading_deg
+    };
+    format!("{display_deg:.0}°")
+}
+
 /// Rotates the Compass dial toward live geographic North and updates the heading readout.
 #[expect(
     clippy::needless_pass_by_value,
@@ -175,23 +199,48 @@ pub fn update_compass_ui(
     mut dial_query: Query<&mut UiTransform, With<CompassDial>>,
     mut heading_query: Query<&mut Text, With<CompassHeadingText>>,
 ) {
-    let north_angle = cam_state.compass_north_angle_rad();
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "UI compass dial rotation is a visual f32 angle"
-    )]
-    let dial_rot = Rot2::radians((-north_angle) as f32);
+    let dial_rot = if cam_state.geographic_north().is_some() {
+        let north_angle = cam_state.compass_north_angle_rad();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "UI compass dial rotation is a visual f32 angle"
+        )]
+        Rot2::radians((-north_angle) as f32)
+    } else {
+        Rot2::IDENTITY
+    };
     for mut tf in &mut dial_query {
         tf.rotation = dial_rot;
     }
 
-    let heading_deg = north_angle.to_degrees().rem_euclid(360.0).round();
-    let display_deg = if heading_deg >= 360.0 {
-        0.0
-    } else {
-        heading_deg
-    };
+    let label = format_compass_heading(&cam_state);
     for mut text in &mut heading_query {
-        text.0 = format!("{display_deg:.0}°");
+        text.0.clone_from(&label);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use strata_globe::{EcefMeters, GlobeError, PlanetSpec};
+
+    #[test]
+    fn compass_heading_formats_angles_and_poles_cleanly() -> Result<(), GlobeError> {
+        let planet = PlanetSpec::earth();
+        let mut eq_cam = GlobeCameraState::new(planet, EcefMeters::from_raw(0.0, 0.0, 1.0))?;
+        assert_eq!(format_compass_heading(&eq_cam), "0°");
+
+        eq_cam.rotate_yaw(-0.001_f64.to_radians());
+        assert_eq!(format_compass_heading(&eq_cam), "0°");
+
+        eq_cam.rotate_yaw(90.0_f64.to_radians());
+        assert_eq!(format_compass_heading(&eq_cam), "90°");
+
+        let north_pole = GlobeCameraState::new(planet, EcefMeters::from_raw(0.0, 1.0, 0.0))?;
+        assert_eq!(format_compass_heading(&north_pole), "N.Pole");
+
+        let south_pole = GlobeCameraState::new(planet, EcefMeters::from_raw(0.0, -1.0, 0.0))?;
+        assert_eq!(format_compass_heading(&south_pole), "S.Pole");
+        Ok(())
     }
 }
