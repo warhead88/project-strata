@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 bevy = { version = "0.20.1", default-features = false, features = ["3d", "ui"] }
 strata-globe = { path = "crates/strata-globe" }
+strata-terrain = { path = "crates/strata-terrain" }
 
 [workspace.lints.rust]
 warnings = "deny"
