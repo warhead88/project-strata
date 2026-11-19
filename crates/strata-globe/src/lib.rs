@@ -15,7 +15,9 @@ pub mod snapshot;
 pub mod tile;
 
 pub use coords::{EcefMeters, LocalOrigin, RebasePolicy, RenderVec3, SurfaceCoord};
-pub use cube::{CubeFace, FaceBasis, FaceUv, ecef_to_face_uv, face_uv_to_unit};
+pub use cube::{
+    CubeFace, FaceBasis, FaceUv, ecef_to_face_uv, ecef_to_face_uv_unit, face_uv_to_unit,
+};
 pub use elevation::{ElevationRange, ElevationSampler, FlatElevation};
 pub use error::GlobeError;
 pub use lod::{

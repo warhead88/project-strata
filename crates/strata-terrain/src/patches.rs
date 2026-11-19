@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
-use strata_globe::{EcefMeters, ElevationRange, TileId};
+use strata_globe::{CubeFace, EcefMeters, ElevationRange, FaceUv, TileId};
 
 use crate::error::TerrainError;
 use crate::hydrology::{Navigability, SEA_LEVEL_METERS, WaterBodyKind, WaterSample};
-use crate::patches_index::{lod5_ancestor, lod5_tile_for_unit, rebuild_spatial_index};
+use crate::patches_index::{
+    lod5_ancestor, lod5_tile_for_face_uv, lod5_tile_for_unit, rebuild_spatial_index,
+};
 use crate::patches_spatial::{Lod5Bucket, PATCH_BUCKET_LOD, PatchEnvelope, PreparedPatch};
 use crate::patches_validate::validate_and_prepare;
 
@@ -165,8 +167,10 @@ impl PatchLayer {
 
     #[inline]
     #[must_use]
-    pub(crate) fn apply_to_sample(
+    pub(crate) fn apply_to_sample_uv(
         &self,
+        face: CubeFace,
+        face_uv: FaceUv,
         unit: EcefMeters,
         planet_radius_m: f64,
         base_elev_m: f64,
@@ -175,9 +179,7 @@ impl PatchLayer {
         if self.patches.is_empty() {
             return (base_elev_m, water);
         }
-        let Some(tile) = lod5_tile_for_unit(unit) else {
-            return (base_elev_m, water);
-        };
+        let tile = lod5_tile_for_face_uv(face, face_uv);
         let Some(bucket) = self.lod5_buckets.get(&tile) else {
             return (base_elev_m, water);
         };
@@ -187,6 +189,36 @@ impl PatchLayer {
         }
         let updated_water = update_water_after_patch(elev, water);
         (elev, updated_water)
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn apply_to_elevation_uv(
+        &self,
+        face: CubeFace,
+        face_uv: FaceUv,
+        unit: EcefMeters,
+        planet_radius_m: f64,
+        base_elev_m: f64,
+    ) -> f64 {
+        if self.patches.is_empty() {
+            return base_elev_m;
+        }
+        let tile = lod5_tile_for_face_uv(face, face_uv);
+        let Some(bucket) = self.lod5_buckets.get(&tile) else {
+            return base_elev_m;
+        };
+        let mut elev = base_elev_m;
+        for &idx in &bucket.patch_indices {
+            elev = self.prepared[idx].apply_elevation(unit, planet_radius_m, elev);
+        }
+        elev
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.patches.is_empty()
     }
 
     #[must_use]

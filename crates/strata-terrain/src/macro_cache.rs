@@ -3,19 +3,18 @@ use strata_globe::{
     face_uv_to_unit,
 };
 
-use crate::earth_geography::{MacroSample, PreparedEarthModel, TerrainSource};
+use crate::earth_geography::{ElevationGridSource, MacroSample, TerrainSource};
 use crate::error::TerrainError;
 use crate::hydrology_index::HydrologyIndex;
-use crate::macro_climate::{evaluate_dem_macro, evaluate_procedural_macro};
+use crate::macro_climate::{evaluate_dem_macro, evaluate_earth_macro};
 use crate::macro_mipmap::{MinMaxNode, build_mip_pyramid, compute_mip_layout};
-use crate::noise::{fbm3, ridged_fbm3};
+use crate::noise::noise3;
 
 /// Default per-face macro cache cell resolution (`6 x 128 x 128` cells).
 pub const DEFAULT_MACRO_RESOLUTION: u32 = 128;
 
-const MICRO_FBM_AMP_M: f64 = 380.0;
-const MICRO_RIDGE_AMP_M: f64 = 520.0;
-pub(crate) const MICRO_MAX_BOUND_M: f64 = MICRO_FBM_AMP_M + 0.5 * MICRO_RIDGE_AMP_M;
+/// Maximum amplitude of fast 2-octave micro-detail noise at `roughness == 1.0`.
+pub(crate) const MICRO_MAX_BOUND_M: f64 = 160.0;
 
 /// Cached macro terrain and climate fields per grid vertex.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,6 +65,7 @@ impl CubeMacroCache {
     pub(crate) fn bake(
         resolution: u32,
         source: &TerrainSource,
+        elevation_source: &ElevationGridSource,
         hydrology: &HydrologyIndex,
     ) -> Result<Self, TerrainError> {
         if !(16..=512).contains(&resolution) || !resolution.is_power_of_two() {
@@ -74,12 +74,13 @@ impl CubeMacroCache {
         let lod_depth = u8::try_from(resolution.trailing_zeros()).unwrap_or(7);
         let n = resolution as usize;
         let stride = n + 1;
-        let vertices = bake_vertices(resolution, source);
+        let (vertices, vertex_bounds) = bake_vertices(resolution, source, elevation_source);
         let (level_offsets, total_mip_per_face) = compute_mip_layout(lod_depth);
         let (mip_nodes, global_range) = build_mip_pyramid(
             resolution,
-            lod_depth,
             &vertices,
+            &vertex_bounds,
+            elevation_source,
             &level_offsets,
             total_mip_per_face,
             hydrology,
@@ -135,15 +136,22 @@ impl CubeMacroCache {
 
     /// Bilinearly samples the cached macro fields at `unit_dir` in strictly `O(1)` time.
     #[must_use]
+    pub(crate) fn sample_bilinear(&self, unit_dir: EcefMeters) -> MacroCell {
+        let Ok((face, uv)) = ecef_to_face_uv(unit_dir) else {
+            return MacroCell::from(default_fallback_sample());
+        };
+        self.sample_bilinear_uv(face, uv)
+    }
+
+    /// Bilinearly samples the cached macro fields using precomputed `(face, uv)`.
+    #[inline]
+    #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "FaceUv is clamped to [0, 1] so cell indices stay within 0..resolution"
     )]
-    pub(crate) fn sample_bilinear(&self, unit_dir: EcefMeters) -> MacroCell {
-        let Ok((face, uv)) = ecef_to_face_uv(unit_dir) else {
-            return MacroCell::from(default_fallback_sample());
-        };
+    pub(crate) fn sample_bilinear_uv(&self, face: CubeFace, uv: FaceUv) -> MacroCell {
         let n = self.resolution as usize;
         let res_f = f64::from(self.resolution);
         let gx = uv.u.clamp(0.0, 1.0) * res_f;
@@ -205,21 +213,79 @@ impl CubeMacroCache {
             geology_province: pick_nearest_province(tx, ty, c00, c10, c01, c11),
         }
     }
+
+    /// Fast roughness-only bilinear lookup using precomputed `(face, uv)`.
+    #[inline]
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "FaceUv is clamped to [0, 1] so cell indices stay within 0..resolution"
+    )]
+    pub(crate) fn sample_roughness_uv(&self, face: CubeFace, uv: FaceUv) -> f64 {
+        let n = self.resolution as usize;
+        let res_f = f64::from(self.resolution);
+        let gx = uv.u.clamp(0.0, 1.0) * res_f;
+        let gy = uv.v.clamp(0.0, 1.0) * res_f;
+        let cx = (gx.floor() as usize).min(n - 1);
+        let cy = (gy.floor() as usize).min(n - 1);
+        #[expect(clippy::cast_precision_loss, reason = "cx, cy <= 512, exact in f64")]
+        let tx = (gx - (cx as f64)).clamp(0.0, 1.0) as f32;
+        #[expect(clippy::cast_precision_loss, reason = "cx, cy <= 512, exact in f64")]
+        let ty = (gy - (cy as f64)).clamp(0.0, 1.0) as f32;
+
+        let base = face.index() * self.stride * self.stride;
+        let r00 = self.vertices[base + cy * self.stride + cx].roughness;
+        let r10 = self.vertices[base + cy * self.stride + cx + 1].roughness;
+        let r01 = self.vertices[base + (cy + 1) * self.stride + cx].roughness;
+        let r11 = self.vertices[base + (cy + 1) * self.stride + cx + 1].roughness;
+        f64::from(bilerp_f32(r00, r10, r01, r11, tx, ty))
+    }
 }
 
-/// Evaluates deterministic 3D micro-detail relief offset bounded by `+-roughness * MICRO_MAX_BOUND_M`.
+/// Fast 2-octave coastline-safe micro-detail offset bounded by `+-roughness * MICRO_MAX_BOUND_M`.
+///
+/// Returns `0.0` over oceans (`dem_elev_m <= 0.0`) and flat plains (`roughness <= 0.04`),
+/// and tapers smoothly across `0..40 m` coastlines so shorelines remain crisp.
+#[inline]
 #[must_use]
-pub(crate) fn micro_detail_offset(unit_dir: EcefMeters, roughness: f64, seed: u64) -> f64 {
-    let f = fbm3(unit_dir, 48.0, 4, 2.15, 0.52, seed.wrapping_add(701));
-    let r = ridged_fbm3(unit_dir, 96.0, 3, 2.2, 0.55, seed.wrapping_add(911));
-    roughness * (f * MICRO_FBM_AMP_M + (r - 0.5) * MICRO_RIDGE_AMP_M)
+pub(crate) fn micro_detail_fast(
+    unit_dir: EcefMeters,
+    dem_elev_m: f64,
+    roughness: f64,
+    seed: u64,
+) -> f64 {
+    if dem_elev_m <= 0.0 || roughness <= 0.04 {
+        return 0.0;
+    }
+    let t = (dem_elev_m * 0.025).min(1.0);
+    let coast_taper = t * t * (3.0 - 2.0 * t);
+    let n0 = noise3(
+        unit_dir.x * 64.0,
+        unit_dir.y * 64.0,
+        unit_dir.z * 64.0,
+        seed.wrapping_add(701),
+    );
+    let n1 = noise3(
+        unit_dir.x * 140.0,
+        unit_dir.y * 140.0,
+        unit_dir.z * 140.0,
+        seed.wrapping_add(911),
+    );
+    let f = n0 * 0.68 + n1 * 0.32;
+    roughness * coast_taper * MICRO_MAX_BOUND_M * f
 }
 
-fn bake_vertices(resolution: u32, source: &TerrainSource) -> Vec<MacroCell> {
+fn bake_vertices(
+    resolution: u32,
+    source: &TerrainSource,
+    elevation_source: &ElevationGridSource,
+) -> (Vec<MacroCell>, Vec<(f64, f64)>) {
     let n = resolution as usize;
     let stride = n + 1;
-    let mut vertices = Vec::with_capacity(6 * stride * stride);
-    let earth_model = matches!(source, TerrainSource::Earth { .. }).then(PreparedEarthModel::new);
+    let count = 6 * stride * stride;
+    let mut vertices = Vec::with_capacity(count);
+    let mut vertex_bounds = Vec::with_capacity(count);
     let inv_n = 1.0 / f64::from(resolution);
 
     for face in CubeFace::ALL {
@@ -230,21 +296,21 @@ fn bake_vertices(resolution: u32, source: &TerrainSource) -> Vec<MacroCell> {
                 #[expect(clippy::cast_precision_loss, reason = "ix <= 512, exact in f64")]
                 let u = if ix == n { 1.0 } else { (ix as f64) * inv_n };
                 let unit_dir = face_uv_to_unit(face, FaceUv::clamped(u, v));
-                let sample = match (source, &earth_model) {
-                    (TerrainSource::Earth { seed }, Some(model)) => model.evaluate(unit_dir, *seed),
-                    (TerrainSource::Procedural { seed }, _) => {
-                        evaluate_procedural_macro(unit_dir, *seed)
+                let (sample, qmin, qmax) = match (source, elevation_source) {
+                    (TerrainSource::Earth { seed }, ElevationGridSource::Earth(dem)) => {
+                        evaluate_earth_macro(dem, unit_dir, *seed)
                     }
-                    (TerrainSource::Dem { grid, seed }, _) => {
+                    (TerrainSource::Dem { seed, .. }, ElevationGridSource::CustomDem(grid)) => {
                         evaluate_dem_macro(grid, unit_dir, *seed)
                     }
-                    (TerrainSource::Earth { .. }, None) => default_fallback_sample(),
+                    _ => (default_fallback_sample(), 0.0, 0.0),
                 };
                 vertices.push(MacroCell::from(sample));
+                vertex_bounds.push((qmin, qmax));
             }
         }
     }
-    vertices
+    (vertices, vertex_bounds)
 }
 
 #[inline]
@@ -271,7 +337,7 @@ fn pick_nearest_province(
     }
 }
 
-const fn default_fallback_sample() -> MacroSample {
+pub(crate) const fn default_fallback_sample() -> MacroSample {
     MacroSample {
         macro_elevation_m: 0.0,
         roughness: 0.0,

@@ -1,0 +1,5 @@
+earth_relief_15m.sdem
+Source: Generic Mapping Tools (GMT) earth_relief_15m_p.grd (SRTM15+ v2.x, 15 arc-minute global relief grid, 1440x720 pixel-registered).
+Authors: Tozer, B., Sandwell, D. T., Smith, W. H. F., Olson, C., Beale, J. R., & Wessel, P. (2019). Global bathymetry and topography at 15 arc sec: SRTM15+. Earth and Space Science, 6, 1847–1864.
+License: CC-BY 4.0 / Public scientific Earth relief dataset.
+Format: Lossless 1-meter integer SDEM v1 binary stream (2D left/up predictor + byte-aligned escape i16).

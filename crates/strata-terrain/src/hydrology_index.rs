@@ -63,6 +63,12 @@ impl HydrologyIndex {
         &self.rivers
     }
 
+    #[inline]
+    pub(crate) fn bucket_has_features(&self, face: CubeFace, lod4_x: usize, lod4_y: usize) -> bool {
+        let bucket = self.buckets[bucket_index(face, lod4_x, lod4_y)];
+        bucket.lake_len > 0 || bucket.seg_len > 0
+    }
+
     /// Returns conservative `(min_m, max_m)` bounds introduced by lakes/rivers overlapping a macro cell.
     pub(crate) fn cell_bounds_contribution(
         &self,
@@ -125,20 +131,81 @@ impl HydrologyIndex {
         let Ok((face, face_uv)) = ecef_to_face_uv(unit_dir) else {
             return dry_or_ocean(base_elev_m);
         };
+        self.carve_and_sample_uv(face, face_uv, unit_dir, base_elev_m)
+    }
+
+    /// Evaluates river/lake carving and water sample using precomputed `(face, face_uv)`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn carve_and_sample_uv(
+        &self,
+        face: CubeFace,
+        face_uv: FaceUv,
+        unit_dir: EcefMeters,
+        base_elev_m: f64,
+    ) -> (f64, WaterSample) {
+        if self.lakes.is_empty() && self.rivers.is_empty() {
+            return dry_or_ocean(base_elev_m);
+        }
         let (bx, by) = face_uv_to_lod4(face_uv);
         let bucket = self.buckets[bucket_index(face, bx, by)];
+        if bucket.lake_len == 0 && bucket.seg_len == 0 {
+            return dry_or_ocean(base_elev_m);
+        }
 
-        let (elev, lake_hit) = self.apply_lakes(bucket, unit_dir, base_elev_m);
+        let (elev, lake_hit) = if bucket.lake_len > 0 {
+            self.apply_lakes(bucket, unit_dir, base_elev_m)
+        } else {
+            (base_elev_m, None)
+        };
         if let Some(sample) = lake_hit {
             return (elev, sample);
         }
 
-        let (elev, river_hit) = self.apply_rivers(bucket, unit_dir, elev);
+        let (elev, river_hit) = if bucket.seg_len > 0 {
+            self.apply_rivers(bucket, unit_dir, elev)
+        } else {
+            (elev, None)
+        };
         if let Some(sample) = river_hit {
             return (elev, sample);
         }
 
         dry_or_ocean(elev)
+    }
+
+    /// Fast elevation-only hydrology carving using precomputed `(face, face_uv)`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn carve_elevation_uv(
+        &self,
+        face: CubeFace,
+        face_uv: FaceUv,
+        unit_dir: EcefMeters,
+        base_elev_m: f64,
+    ) -> f64 {
+        if self.lakes.is_empty() && self.rivers.is_empty() {
+            return base_elev_m;
+        }
+        let (bx, by) = face_uv_to_lod4(face_uv);
+        let bucket = self.buckets[bucket_index(face, bx, by)];
+        if bucket.lake_len == 0 && bucket.seg_len == 0 {
+            return base_elev_m;
+        }
+        let (elev, lake_hit) = if bucket.lake_len > 0 {
+            self.apply_lakes(bucket, unit_dir, base_elev_m)
+        } else {
+            (base_elev_m, None)
+        };
+        if lake_hit.is_some() {
+            return elev;
+        }
+        if bucket.seg_len > 0 {
+            let (elev, _) = self.apply_rivers(bucket, unit_dir, elev);
+            elev
+        } else {
+            elev
+        }
     }
 
     fn apply_lakes(

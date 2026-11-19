@@ -7,6 +7,7 @@
 pub mod climate;
 pub mod dem;
 mod earth_data;
+mod earth_dem;
 pub mod earth_geography;
 pub mod error;
 pub mod hydrology;

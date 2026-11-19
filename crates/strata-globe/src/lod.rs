@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 
 use crate::coords::EcefMeters;
 use crate::culling::{
-    TileBounds, is_culled, min_sample_distance, tile_geometric_error_meters,
-    validate_selection_inputs,
+    CullingFrame, FastTileMap, FastTileSet, eval_tile_visibility_and_distance,
+    min_sample_distance_from_range, tile_geometric_error_meters, validate_selection_inputs,
 };
 use crate::elevation::{ElevationSampler, FlatElevation};
 use crate::error::GlobeError;
@@ -228,20 +229,26 @@ pub fn select_tiles_with_elevation<S: std::hash::BuildHasher + Default>(
     validate_selection_inputs(camera, config, sampler)?;
     let global_range = sampler.global_range();
     let effective_min_lod = config.min_lod.min(planet.max_lod());
+    let frame = CullingFrame::new(planet, camera, global_range);
 
-    let mut leaves = HashSet::new();
+    let est_leaves = previously_split.len().saturating_mul(2).max(64);
+    let mut leaves: FastTileSet =
+        HashSet::with_capacity_and_hasher(est_leaves, BuildHasherDefault::default());
+    let mut leaf_metrics: FastTileMap<(f64, f64)> =
+        HashMap::with_capacity_and_hasher(est_leaves, BuildHasherDefault::default());
     let mut next_split = HashSet::default();
-    let mut stack = TileId::roots().to_vec();
+    let mut stack = Vec::with_capacity(64);
+    stack.extend(TileId::roots());
     let sse_scale = camera.viewport_height_px / (2.0 * (camera.fov_y_rad * 0.5).tan());
 
     while let Some(tile) = stack.pop() {
         let tile_range = sampler.tile_range(planet, tile);
-        let bounds = TileBounds::compute(planet, tile, tile_range);
-        if is_culled(planet, camera, config, &bounds, global_range) {
+        let Some(min_dist) =
+            eval_tile_visibility_and_distance(planet, &frame, camera, config, tile, tile_range)
+        else {
             continue;
-        }
+        };
 
-        let min_dist = min_sample_distance(planet, camera.position, tile, sampler);
         let geom_err = tile_geometric_error_meters(planet, tile, config, tile_range);
         let sse_px = (geom_err / min_dist.max(0.25)) * sse_scale;
 
@@ -260,29 +267,31 @@ pub fn select_tiles_with_elevation<S: std::hash::BuildHasher + Default>(
             stack.extend(children);
         } else {
             leaves.insert(tile);
+            leaf_metrics.insert(tile, (min_dist, sse_px));
         }
     }
 
     balance_quadtree(&mut leaves, planet.max_lod());
     *previously_split = next_split;
 
-    let mut tiles: Vec<SelectedTile> = leaves
-        .iter()
-        .copied()
-        .map(|id| {
-            let coarser_edges = compute_coarser_edges(id, &leaves);
+    let mut tiles: Vec<SelectedTile> = Vec::with_capacity(leaves.len());
+    for &id in &leaves {
+        let coarser_edges = compute_coarser_edges(id, &leaves);
+        let (distance_meters, sse_px) = if let Some(&metrics) = leaf_metrics.get(&id) {
+            metrics
+        } else {
             let tile_range = sampler.tile_range(planet, id);
-            let distance_meters = min_sample_distance(planet, camera.position, id, sampler);
+            let dist = min_sample_distance_from_range(planet, camera.position, id, tile_range);
             let geom_err = tile_geometric_error_meters(planet, id, config, tile_range);
-            let sse_px = (geom_err / distance_meters.max(0.25)) * sse_scale;
-            SelectedTile {
-                id,
-                coarser_edges,
-                distance_meters,
-                sse_px,
-            }
-        })
-        .collect();
+            (dist, (geom_err / dist.max(0.25)) * sse_scale)
+        };
+        tiles.push(SelectedTile {
+            id,
+            coarser_edges,
+            distance_meters,
+            sse_px,
+        });
+    }
     tiles.sort_by_key(|t| t.id);
 
     let min_lod_selected = tiles.iter().map(|t| t.id.lod).min().unwrap_or(0);
@@ -295,14 +304,13 @@ pub fn select_tiles_with_elevation<S: std::hash::BuildHasher + Default>(
     })
 }
 
-fn balance_quadtree(leaves: &mut HashSet<TileId>, max_lod: u8) {
+fn balance_quadtree(leaves: &mut FastTileSet, max_lod: u8) {
+    let mut level_tiles = Vec::new();
+    let mut chain = Vec::with_capacity(usize::from(max_lod));
     for target_lod in (2..=max_lod).rev() {
-        let level_tiles: Vec<TileId> = leaves
-            .iter()
-            .copied()
-            .filter(|t| t.lod == target_lod)
-            .collect();
-        for tile in level_tiles {
+        level_tiles.clear();
+        level_tiles.extend(leaves.iter().copied().filter(|t| t.lod == target_lod));
+        for &tile in &level_tiles {
             if !leaves.contains(&tile) {
                 continue;
             }
@@ -311,22 +319,21 @@ fn balance_quadtree(leaves: &mut HashSet<TileId>, max_lod: u8) {
             };
             for edge in TileEdge::ALL {
                 let neighbor_p = parent.neighbor(edge).tile;
-                split_ancestors_to_reach(leaves, neighbor_p);
+                split_ancestors_to_reach(leaves, neighbor_p, &mut chain);
             }
         }
     }
 }
 
-fn split_ancestors_to_reach(leaves: &mut HashSet<TileId>, target: TileId) {
+fn split_ancestors_to_reach(leaves: &mut FastTileSet, target: TileId, chain: &mut Vec<TileId>) {
     if leaves.contains(&target) {
         return;
     }
-    let mut chain = Vec::new();
+    chain.clear();
     let mut cursor = target;
     while let Some(parent) = cursor.parent() {
         chain.push(parent);
         if leaves.contains(&parent) {
-            // Split from the found leaf ancestor down toward `target`.
             while let Some(ancestor) = chain.pop() {
                 if leaves.remove(&ancestor)
                     && let Some(children) = ancestor.children()
@@ -340,7 +347,8 @@ fn split_ancestors_to_reach(leaves: &mut HashSet<TileId>, target: TileId) {
     }
 }
 
-fn compute_coarser_edges(tile: TileId, leaves: &HashSet<TileId>) -> CoarserEdges {
+#[inline]
+fn compute_coarser_edges(tile: TileId, leaves: &FastTileSet) -> CoarserEdges {
     if tile.lod == 0 {
         return CoarserEdges::NONE;
     }

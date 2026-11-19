@@ -66,13 +66,57 @@ impl DemGrid {
 
     /// Bilinearly samples elevation in meters at unit direction `unit_dir` (`O(1)`).
     #[must_use]
+    pub fn sample_bilinear(&self, unit_dir: EcefMeters) -> f64 {
+        let (x0, x1, y0, y1, tx, ty) = self.texel_quad(unit_dir);
+        let e00 = f64::from(self.elevations_m[y0 * self.width + x0]);
+        let e10 = f64::from(self.elevations_m[y0 * self.width + x1]);
+        let e01 = f64::from(self.elevations_m[y1 * self.width + x0]);
+        let e11 = f64::from(self.elevations_m[y1 * self.width + x1]);
+
+        let top = e00 + (e10 - e00) * tx;
+        let bot = e01 + (e11 - e01) * tx;
+        top + (bot - top) * ty
+    }
+
+    /// Minimum and maximum of the 4 surrounding DEM texels for conservative tile bounds.
+    #[must_use]
+    pub(crate) fn sample_quad_minmax(&self, unit_dir: EcefMeters) -> (f64, f64) {
+        let (x0, x1, y0, y1, _, _) = self.texel_quad(unit_dir);
+        let e00 = f64::from(self.elevations_m[y0 * self.width + x0]);
+        let e10 = f64::from(self.elevations_m[y0 * self.width + x1]);
+        let e01 = f64::from(self.elevations_m[y1 * self.width + x0]);
+        let e11 = f64::from(self.elevations_m[y1 * self.width + x1]);
+        (
+            e00.min(e10).min(e01).min(e11),
+            e00.max(e10).max(e01).max(e11),
+        )
+    }
+
+    /// Evaluates `(bilinear_elev_m, local_relief_m, quad_min_m, quad_max_m)` in one texel quad lookup.
+    #[must_use]
+    pub(crate) fn sample_bilinear_relief_minmax(
+        &self,
+        unit_dir: EcefMeters,
+    ) -> (f64, f64, f64, f64) {
+        let (x0, x1, y0, y1, tx, ty) = self.texel_quad(unit_dir);
+        let e00 = f64::from(self.elevations_m[y0 * self.width + x0]);
+        let e10 = f64::from(self.elevations_m[y0 * self.width + x1]);
+        let e01 = f64::from(self.elevations_m[y1 * self.width + x0]);
+        let e11 = f64::from(self.elevations_m[y1 * self.width + x1]);
+        let qmin = e00.min(e10).min(e01).min(e11);
+        let qmax = e00.max(e10).max(e01).max(e11);
+        let top = e00 + (e10 - e00) * tx;
+        let bot = e01 + (e11 - e01) * tx;
+        (top + (bot - top) * ty, qmax - qmin, qmin, qmax)
+    }
+
     #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "DEM raster indices are bounded by validated dimensions and clamped non-negative"
     )]
-    pub fn sample_bilinear(&self, unit_dir: EcefMeters) -> f64 {
+    fn texel_quad(&self, unit_dir: EcefMeters) -> (usize, usize, usize, usize, f64, f64) {
         let lat_rad = unit_dir.y.clamp(-1.0, 1.0).asin();
         let lon_rad = unit_dir.x.atan2(unit_dir.z);
 
@@ -89,14 +133,6 @@ impl DemGrid {
 
         let tx = fx - fx.floor();
         let ty = fy - (y0 as f64);
-
-        let e00 = f64::from(self.elevations_m[y0 * self.width + x0]);
-        let e10 = f64::from(self.elevations_m[y0 * self.width + x1]);
-        let e01 = f64::from(self.elevations_m[y1 * self.width + x0]);
-        let e11 = f64::from(self.elevations_m[y1 * self.width + x1]);
-
-        let top = e00 + (e10 - e00) * tx;
-        let bot = e01 + (e11 - e01) * tx;
-        top + (bot - top) * ty
+        (x0, x1, y0, y1, tx, ty)
     }
 }

@@ -11,17 +11,24 @@ use crate::patches_spatial::{
     PreparedKind, PreparedPatch,
 };
 
-pub(crate) fn lod5_tile_for_unit(unit: EcefMeters) -> Option<TileId> {
-    let Ok((face, face_uv)) = ecef_to_face_uv(unit) else {
-        return None;
-    };
+pub(crate) fn lod5_tile_for_face_uv(
+    face: strata_globe::CubeFace,
+    face_uv: strata_globe::FaceUv,
+) -> TileId {
     let (x, y, _) = face_uv_to_tile_uv(PATCH_BUCKET_LOD, face_uv);
-    Some(TileId {
+    TileId {
         face,
         lod: PATCH_BUCKET_LOD,
         x,
         y,
-    })
+    }
+}
+
+pub(crate) fn lod5_tile_for_unit(unit: EcefMeters) -> Option<TileId> {
+    let Ok((face, face_uv)) = ecef_to_face_uv(unit) else {
+        return None;
+    };
+    Some(lod5_tile_for_face_uv(face, face_uv))
 }
 
 pub(crate) fn lod5_ancestor(tile: TileId) -> TileId {

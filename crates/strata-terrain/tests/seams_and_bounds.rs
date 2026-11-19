@@ -220,3 +220,47 @@ fn tile_range_is_strictly_conservative_across_lods_and_tight_on_ocean() {
     );
     assert!(ocean_range.max_meters < -1_500.0);
 }
+
+#[test]
+fn extreme_landmarks_tile_range_is_conservative() {
+    let world = TerrainWorld::earth_default();
+    let planet = world.planet();
+
+    for (label, lat, lon) in [
+        ("Himalayas", 28.0, 86.9),
+        ("Mariana", 11.3, 142.2),
+        ("Alps", 46.5, 8.0),
+        ("Andes", -15.0, -70.0),
+        ("NorthPole", 89.8, 120.0),
+        ("SouthPole", -89.8, -45.0),
+    ] {
+        let center = lat_lon_to_unit(lat, lon);
+        let Ok((f, fuv)) = strata_globe::ecef_to_face_uv(center) else {
+            unreachable!("unit vector");
+        };
+        for lod in [4_u8, 7, 10] {
+            let (tx, ty, _) = strata_globe::face_uv_to_tile_uv(lod, fuv);
+            let tile = TileId {
+                face: f,
+                lod,
+                x: tx,
+                y: ty,
+            };
+            let range = world.tile_range(planet, tile);
+            for sy in 0..=8 {
+                let v = f64::from(sy) * 0.125;
+                for sx in 0..=8 {
+                    let u = f64::from(sx) * 0.125;
+                    let unit = face_uv_to_unit(f, tile.tile_uv_to_face_uv(TileUv::clamped(u, v)));
+                    let elev = world.sample_elevation(unit);
+                    assert!(
+                        elev >= range.min_meters && elev <= range.max_meters,
+                        "{label} {tile:?} range [{}, {}] failed to bound elev {elev} at ({u},{v})",
+                        range.min_meters,
+                        range.max_meters
+                    );
+                }
+            }
+        }
+    }
+}
