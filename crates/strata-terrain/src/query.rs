@@ -124,6 +124,19 @@ pub struct RenderVertexSample {
     pub water: WaterSample,
 }
 
+/// Single-pass base vertex bundle for client tile mesh generation (`Step 2`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TileVertexBase {
+    /// Final surface elevation in meters (including hydrology and patches).
+    pub elevation_m: f64,
+    /// Hydrological state at this vertex.
+    pub water: WaterSample,
+    /// Climate and cryosphere indicators at this vertex.
+    pub climate: ClimateSample,
+    /// Physical-geographic biome at this vertex.
+    pub biome: Biome,
+}
+
 /// Aggregate engineering, hydrological, and geographic assessment over a circular site.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SiteAssessment {

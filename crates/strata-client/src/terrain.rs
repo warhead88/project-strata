@@ -151,17 +151,26 @@ fn march_terrain_hit(
     t_end: f64,
     sampler: &dyn ElevationSampler,
 ) -> Option<(EcefMeters, f64)> {
-    const MARCH_STEPS: u32 = 512;
+    const COARSE_STEPS: u32 = 48;
+    const BISECTION_STEPS: u32 = 24;
     let r_base = planet.radius_meters();
     let min_r = 1.0_f64.min(r_base * 0.5);
+    let min_elev = min_r - r_base;
 
     let signed_height = |t: f64| -> f64 {
         let p = cam_view.position + ray_dir.scale(t);
         let p_r = p.norm();
-        let Ok(unit) = p.normalized() else {
+        if p_r <= 0.0 || !p_r.is_finite() {
             return -r_base;
+        }
+        let unit = p.scale(1.0 / p_r);
+        let elev = sampler.sample_elevation(unit);
+        let clamped = if elev.is_finite() {
+            elev.max(min_elev)
+        } else {
+            0.0
         };
-        let surf_r = (r_base + sample_clamped_elevation(planet, unit, sampler)).max(min_r);
+        let surf_r = (r_base + clamped).max(min_r);
         p_r - surf_r
     };
 
@@ -178,10 +187,10 @@ fn march_terrain_hit(
 
     let mut t_prev = t_start;
     let span = t_end - t_start;
-    let inv_steps = 1.0 / f64::from(MARCH_STEPS);
+    let inv_steps = 1.0 / f64::from(COARSE_STEPS);
 
     let mut bracket: Option<(f64, f64)> = None;
-    for step in 1..=MARCH_STEPS {
+    for step in 1..=COARSE_STEPS {
         let t_curr = t_start + span * (f64::from(step) * inv_steps);
         if signed_height(t_curr) <= 0.0 {
             bracket = Some((t_prev, t_curr));
@@ -191,7 +200,7 @@ fn march_terrain_hit(
     }
 
     let (mut lo, mut hi) = bracket?;
-    for _ in 0..64 {
+    for _ in 0..BISECTION_STEPS {
         if hi - lo <= 1e-6 {
             break;
         }

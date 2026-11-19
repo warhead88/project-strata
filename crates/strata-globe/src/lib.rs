@@ -27,7 +27,7 @@ pub use lod::{
 pub use mesh::{
     TileMeshF64, TileRenderMesh, build_stitched_indices, build_tile_mesh_f64,
     build_tile_mesh_f64_with_elevation, build_tile_render_mesh,
-    build_tile_render_mesh_with_elevation,
+    build_tile_render_mesh_with_elevation, canonical_tangent_basis,
 };
 pub use planet::{
     DEFAULT_GRID_SEGMENTS, DEFAULT_MAX_LOD, EARTH_MEAN_RADIUS_METERS, MAX_SUPPORTED_LOD, PlanetSpec,

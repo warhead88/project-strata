@@ -30,6 +30,7 @@ mod strata_layers;
 mod strata_minerals;
 pub mod terrain_config;
 pub mod terrain_world;
+mod terrain_world_queries;
 
 pub use climate::{Biome, ClimateSample, classify_biome, surface_albedo_rgb};
 pub use dem::DemGrid;
@@ -48,7 +49,9 @@ pub use hydrology::{
 pub use macro_cache::{DEFAULT_MACRO_RESOLUTION, MacroCell};
 pub use noise::{fbm3, noise3, ridged_fbm3};
 pub use patches::{PatchId, PatchReceipt, TerrainPatch, TerrainPatchKind};
-pub use query::{GeographicTags, RenderVertexSample, SiteAssessment, TerrainSample};
+pub use query::{
+    GeographicTags, RenderVertexSample, SiteAssessment, TerrainSample, TileVertexBase,
+};
 pub use strata::{
     BedrockKind, GeologyProvince, MAX_STRATA_DEPTH_M, MAX_STRATA_LAYERS, MineralPotential,
     StrataColumn, StratumLayer, SurfaceMaterial,

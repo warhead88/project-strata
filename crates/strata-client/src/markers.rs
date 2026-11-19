@@ -1,13 +1,11 @@
-use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
-use strata_globe::{ControlPointKind, PointId, ecef_to_tile_uv};
-use strata_simulation::{ClockStatus, SimulationSnapshot};
-use strata_terrain::{Biome, TerrainWorld, WaterBodyKind};
+use strata_globe::{ControlPointKind, PointId};
 
 use crate::camera::{GlobeCameraState, OriginState};
 use crate::globe_render::GlobeRenderState;
+use crate::hud::format_hud_into;
 use crate::snapshot::{ClientWorldView, SelectedPointState};
 use crate::terrain::{TerrainElevation, sample_clamped_elevation};
 
@@ -15,6 +13,10 @@ use crate::terrain::{TerrainElevation, sample_clamped_elevation};
 #[derive(Resource, Default)]
 pub struct MarkerRenderMap {
     entities: HashMap<PointId, Entity>,
+    cached_point_ids: Vec<PointId>,
+    active_ids_scratch: HashSet<PointId>,
+    stale_ids_scratch: Vec<PointId>,
+    hud_scratch: String,
     marker_mesh: Option<Handle<Mesh>>,
     active_material: Option<Handle<StandardMaterial>>,
     inactive_material: Option<Handle<StandardMaterial>>,
@@ -43,10 +45,11 @@ pub fn setup_markers_and_hud(
     });
 
     commands.insert_resource(MarkerRenderMap {
-        entities: HashMap::new(),
+        hud_scratch: String::with_capacity(640),
         marker_mesh: Some(sphere_mesh),
         active_material: Some(active_mat),
         inactive_material: Some(inactive_mat),
+        ..default()
     });
 
     commands
@@ -111,19 +114,8 @@ pub fn sync_markers_and_hud(
         return;
     };
 
-    let active_ids: std::collections::HashSet<PointId> =
-        snapshot.points.iter().map(|p| p.id).collect();
-    let stale_ids: Vec<PointId> = marker_map
-        .entities
-        .keys()
-        .copied()
-        .filter(|id| !active_ids.contains(id))
-        .collect();
-    for id in stale_ids {
-        if let Some(entity) = marker_map.entities.remove(&id) {
-            commands.entity(entity).despawn();
-        }
-    }
+    let marker_map = &mut *marker_map;
+    reconcile_marker_ids(&mut commands, marker_map, &snapshot.points);
 
     for pt in &snapshot.points {
         let is_selected = pt.id == selected.selected_id;
@@ -152,9 +144,17 @@ pub fn sync_markers_and_hud(
 
         if let Some(&entity) = marker_map.entities.get(&pt.id) {
             if let Ok((mut tf, mut mat)) = marker_query.get_mut(entity) {
-                tf.translation = Vec3::new(rel.x, rel.y, rel.z);
-                tf.scale = Vec3::splat(radius_scale);
-                mat.0 = target_mat;
+                let next_pos = Vec3::new(rel.x, rel.y, rel.z);
+                if tf.translation != next_pos {
+                    tf.translation = next_pos;
+                }
+                let next_scale = Vec3::splat(radius_scale);
+                if tf.scale != next_scale {
+                    tf.scale = next_scale;
+                }
+                if mat.0 != target_mat {
+                    mat.0 = target_mat;
+                }
             }
         } else {
             let entity = commands
@@ -173,7 +173,9 @@ pub fn sync_markers_and_hud(
     }
 
     if let Ok(mut hud_text) = hud_query.single_mut() {
-        hud_text.0 = format_hud(
+        marker_map.hud_scratch.clear();
+        format_hud_into(
+            &mut marker_map.hud_scratch,
             world_view.frame(),
             selected.active_point(snapshot),
             &cam_state,
@@ -182,6 +184,46 @@ pub fn sync_markers_and_hud(
             terrain.world().map(std::sync::Arc::as_ref),
             selected.auto_sweep,
         );
+        if hud_text.0 != marker_map.hud_scratch {
+            hud_text.0.clone_from(&marker_map.hud_scratch);
+        }
+    }
+}
+
+fn reconcile_marker_ids(
+    commands: &mut Commands,
+    marker_map: &mut MarkerRenderMap,
+    points: &[strata_globe::AuthoritativePoint],
+) {
+    let ids_unchanged = marker_map.cached_point_ids.len() == points.len()
+        && marker_map
+            .cached_point_ids
+            .iter()
+            .zip(points.iter())
+            .all(|(&cached_id, pt)| cached_id == pt.id);
+    if ids_unchanged {
+        return;
+    }
+    marker_map.cached_point_ids.clear();
+    marker_map
+        .cached_point_ids
+        .extend(points.iter().map(|p| p.id));
+    marker_map.active_ids_scratch.clear();
+    marker_map
+        .active_ids_scratch
+        .extend(marker_map.cached_point_ids.iter().copied());
+    marker_map.stale_ids_scratch.clear();
+    marker_map.stale_ids_scratch.extend(
+        marker_map
+            .entities
+            .keys()
+            .copied()
+            .filter(|id| !marker_map.active_ids_scratch.contains(id)),
+    );
+    for id in marker_map.stale_ids_scratch.drain(..) {
+        if let Some(entity) = marker_map.entities.remove(&id) {
+            commands.entity(entity).despawn();
+        }
     }
 }
 
@@ -228,154 +270,4 @@ fn draw_selected_crosshair(
         to_v3(point + north.scale(span)),
         Color::srgb(0.35, 0.95, 0.45),
     );
-}
-
-fn format_hud(
-    frame: &SimulationSnapshot,
-    active: Option<&strata_globe::AuthoritativePoint>,
-    cam_state: &GlobeCameraState,
-    origin_state: &OriginState,
-    render_state: &GlobeRenderState,
-    terrain_world: Option<&TerrainWorld>,
-    auto_sweep: bool,
-) -> String {
-    let snapshot = frame.world();
-    let time = frame.confirmed_time();
-    let elapsed = time.elapsed();
-    let status = match frame.clock_status() {
-        ClockStatus::Running => "Running",
-        ClockStatus::Pausing => "Pausing",
-        ClockStatus::Paused => "Paused",
-    };
-    let mut out = String::with_capacity(640);
-    let _ = writeln!(
-        out,
-        "Game time {:02}:{:02}:{:02}.{:03} | {status} | Space Pause/Resume",
-        elapsed.as_secs() / 3600,
-        elapsed.as_secs() / 60 % 60,
-        elapsed.as_secs() % 60,
-        elapsed.subsec_millis(),
-    );
-    let _ = writeln!(
-        out,
-        "Project Strata | Planet R = {:.0} km | Tick {} | Tiles {} / Cached {} / Pending {} (LOD {}..{})",
-        snapshot.planet.radius_meters() / 1_000.0,
-        time.ticks(),
-        render_state.active_tile_count,
-        render_state.cached_tile_count,
-        render_state.pending_task_count,
-        render_state.min_lod,
-        render_state.max_lod,
-    );
-    let blend = cam_state.orbital_blend();
-    let view_mode = if blend >= 0.999 {
-        "Planet (Center)"
-    } else if blend <= 0.001 {
-        "Surface"
-    } else {
-        "Transition"
-    };
-    let _ = writeln!(
-        out,
-        "Altitude: {:.1} m | View: {view_mode} (pitch {:.1} deg) | Rebases: {} | Sweep: {} | Debug (G): {}",
-        cam_state.altitude_meters,
-        cam_state.effective_pitch_rad().to_degrees(),
-        origin_state.rebase_count,
-        if auto_sweep { "ON" } else { "OFF" },
-        if render_state.debug_overlay {
-            "ON"
-        } else {
-            "OFF"
-        },
-    );
-    if let Some(world) = terrain_world {
-        let sample = world.sample_terrain(cam_state.focus_unit);
-        let water_desc = format_water_status(world, &sample.water);
-        let _ = writeln!(
-            out,
-            "Terrain: Elev {:+.1} m | Biome: {} | Water: {} | Province: {}",
-            sample.elevation_m,
-            biome_label(sample.biome),
-            water_desc,
-            sample.province.label(),
-        );
-    }
-    if let Some(pt) = active {
-        let tile_info = ecef_to_tile_uv(snapshot.planet, pt.position, render_state.max_lod)
-            .map_or_else(
-                |_| String::from("n/a"),
-                |(tile, _, _)| {
-                    format!(
-                        "{} L{} ({}, {})",
-                        tile.face.label(),
-                        tile.lod,
-                        tile.x,
-                        tile.y
-                    )
-                },
-            );
-        let rel = origin_state.origin.to_render_vec3(pt.position);
-        let _ = writeln!(
-            out,
-            "Selected [{}]: {} | Tile {}",
-            pt.id.0, pt.label, tile_info
-        );
-        let _ = writeln!(
-            out,
-            "  ECEF f64: ({:.3}, {:.3}, {:.3}) m",
-            pt.position.x, pt.position.y, pt.position.z
-        );
-        let _ = writeln!(
-            out,
-            "  Render f32: ({:.3}, {:.3}, {:.3}) m",
-            rel.x, rel.y, rel.z
-        );
-    }
-    let _ = write!(
-        out,
-        "Controls: Wheel/+-/PgUpDn Zoom-to-Cursor | MMB/WASD/Arrows Pan | RMB/Alt+MMB/Q-E Rotate+Tilt | N/Home/Compass North | 1-7/Tab Point | P/L/R | G Debug"
-    );
-    out
-}
-
-fn format_water_status(world: &TerrainWorld, water: &strata_terrain::WaterSample) -> String {
-    match water.kind {
-        WaterBodyKind::Dry => String::from("Dry"),
-        WaterBodyKind::Ocean => format!("Ocean (depth {:.1} m)", water.depth_m),
-        WaterBodyKind::Lake(id) => {
-            let name = world
-                .lakes()
-                .iter()
-                .find(|l| l.id == id)
-                .map_or("Lake", |l| l.name);
-            format!("Lake: {name} (depth {:.1} m)", water.depth_m)
-        }
-        WaterBodyKind::River(id) => {
-            let name = world
-                .rivers()
-                .iter()
-                .find(|r| r.id == id)
-                .map_or("River", |r| r.name);
-            format!("River: {name} (depth {:.1} m)", water.depth_m)
-        }
-    }
-}
-
-const fn biome_label(biome: Biome) -> &'static str {
-    match biome {
-        Biome::PolarIce => "Polar Ice",
-        Biome::Tundra => "Tundra",
-        Biome::BorealForest => "Boreal Forest",
-        Biome::TemperateForest => "Temperate Forest",
-        Biome::TemperateGrassland => "Temperate Grassland",
-        Biome::Steppe => "Steppe",
-        Biome::HotDesert => "Hot Desert",
-        Biome::ColdDesert => "Cold Desert",
-        Biome::Savanna => "Savanna",
-        Biome::TropicalRainforest => "Tropical Rainforest",
-        Biome::AlpineTundra => "Alpine Tundra",
-        Biome::AlpineRock => "Alpine Rock",
-        Biome::CoastalWetland => "Coastal Wetland",
-        Biome::OpenWater => "Open Water",
-    }
 }
