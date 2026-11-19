@@ -4,9 +4,11 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use strata_globe::EcefMeters;
 
 use crate::camera::{GlobeCameraState, OriginState};
-use crate::globe_render::GlobeRenderState;
 use crate::snapshot::ClientWorldView;
 use crate::terrain::{TerrainElevation, sample_clamped_elevation};
+
+#[derive(Default, Resource)]
+pub(crate) struct TerrainDebug(pub(crate) bool);
 
 /// Draws great-circle cube-face edge highlights using `Gizmos` when `debug_overlay` is active.
 #[expect(
@@ -19,9 +21,9 @@ pub fn draw_cube_face_seams(
     terrain: Res<TerrainElevation>,
     cam_state: Res<GlobeCameraState>,
     origin_state: Res<OriginState>,
-    render_state: Res<GlobeRenderState>,
+    debug: Res<TerrainDebug>,
 ) {
-    if !render_state.debug_overlay {
+    if !debug.0 {
         return;
     }
     let planet = world_view.snapshot().planet;

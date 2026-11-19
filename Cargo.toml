@@ -11,6 +11,8 @@ publish = false
 
 [workspace.dependencies]
 bevy = { version = "0.20.1", default-features = false, features = ["3d", "ui"] }
+bytemuck = { version = "1.25.2", features = ["derive"] }
+wgpu = { version = "30.0.2", default-features = false }
 strata-globe = { path = "crates/strata-globe" }
 strata-simulation = { path = "crates/strata-simulation" }
 strata-terrain = { path = "crates/strata-terrain" }

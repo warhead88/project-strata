@@ -31,9 +31,9 @@ pub(crate) struct HydrologyIndex {
     planet_radius_m: f64,
     lakes: Vec<LakeDef>,
     rivers: Vec<RiverDef>,
-    buckets: Vec<BucketRange>,
-    bucket_lakes: Vec<u16>,
-    bucket_segs: Vec<RiverSegRef>,
+    pub(crate) buckets: Vec<BucketRange>,
+    pub(crate) bucket_lakes: Vec<u16>,
+    pub(crate) bucket_segs: Vec<RiverSegRef>,
 }
 
 impl HydrologyIndex {

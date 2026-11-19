@@ -4,6 +4,7 @@ use bevy::prelude::*;
 use strata_globe::{ControlPointKind, PointId};
 
 use crate::camera::{GlobeCameraState, OriginState};
+use crate::globe_debug::TerrainDebug;
 use crate::globe_render::GlobeRenderState;
 use crate::hud::format_hud_into;
 use crate::snapshot::{ClientWorldView, SelectedPointState};
@@ -91,7 +92,8 @@ pub fn sync_markers_and_hud(
     selected: Res<SelectedPointState>,
     cam_state: Res<GlobeCameraState>,
     origin_state: Res<OriginState>,
-    render_state: Res<GlobeRenderState>,
+    render_state: Option<Res<GlobeRenderState>>,
+    debug: Res<TerrainDebug>,
     mut marker_map: ResMut<MarkerRenderMap>,
     mut marker_query: Query<(&mut Transform, &mut MeshMaterial3d<StandardMaterial>)>,
     mut hud_query: Query<&mut Text, With<GlobeHudText>>,
@@ -176,11 +178,12 @@ pub fn sync_markers_and_hud(
         marker_map.hud_scratch.clear();
         format_hud_into(
             &mut marker_map.hud_scratch,
+            debug.0,
             world_view.frame(),
             selected.active_point(snapshot),
             &cam_state,
             &origin_state,
-            &render_state,
+            render_state.as_deref(),
             terrain.world().map(std::sync::Arc::as_ref),
             selected.auto_sweep,
         );

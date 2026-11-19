@@ -28,9 +28,11 @@ pub mod strata;
 mod strata_derive;
 mod strata_layers;
 mod strata_minerals;
+mod surface_data;
 pub mod terrain_config;
 pub mod terrain_world;
 mod terrain_world_queries;
+pub use surface_data::{HYDROLOGY_BUCKET_DIM, SurfaceData, SurfaceRaster, SurfaceWaterFeature};
 
 pub use climate::{Biome, ClimateSample, classify_biome, surface_albedo_rgb};
 pub use dem::DemGrid;

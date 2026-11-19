@@ -7,6 +7,7 @@ use strata_globe::{
 };
 
 use crate::camera::{GlobeCameraState, OriginState};
+use crate::globe_debug::TerrainDebug;
 use crate::globe_materials::{GlobeMaterials, SelectionKey};
 use crate::snapshot::ClientWorldView;
 use crate::terrain::TerrainElevation;
@@ -50,8 +51,6 @@ pub struct GlobeRenderState {
     pub min_lod: u8,
     /// Maximum LOD among active tiles.
     pub max_lod: u8,
-    /// When `true`, switches tiles to cube-face grid materials and renders seam gizmos.
-    pub debug_overlay: bool,
 }
 
 impl GlobeRenderState {
@@ -81,12 +80,11 @@ impl GlobeRenderState {
             pending_task_count: 0,
             min_lod: 0,
             max_lod: 0,
-            debug_overlay: false,
         }
     }
 
-    fn terrain_material_for(&self, tile: TileId) -> Handle<StandardMaterial> {
-        self.materials.terrain_for(tile, self.debug_overlay)
+    fn terrain_material_for(&self, tile: TileId, debug: bool) -> Handle<StandardMaterial> {
+        self.materials.terrain_for(tile, debug)
     }
 }
 
@@ -114,6 +112,7 @@ pub fn sync_globe_tiles(
     terrain: Res<TerrainElevation>,
     cam_state: Res<GlobeCameraState>,
     origin_state: Res<OriginState>,
+    debug: Res<TerrainDebug>,
     mut render_state: ResMut<GlobeRenderState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut tile_query: TileEntityQuery<'_, '_>,
@@ -152,7 +151,7 @@ pub fn sync_globe_tiles(
     let selection_key = SelectionKey::new(&cam_view, planet, terrain_rev, render_state.lod_config);
     let selection_unchanged = render_state.last_selection_key == Some(selection_key);
     let origin_changed = render_state.last_origin != Some(origin_state.origin);
-    let overlay_changed = render_state.applied_debug_overlay != render_state.debug_overlay;
+    let overlay_changed = render_state.applied_debug_overlay != debug.0;
 
     // Zero-work idle fast path: camera, terrain, origin, overlay unchanged and streaming complete.
     if selection_unchanged
@@ -191,7 +190,7 @@ pub fn sync_globe_tiles(
         &terrain,
         origin_state.origin,
         origin_changed,
-        overlay_changed,
+        debug.0,
         &selection,
     );
     render_state.last_selection = selection;
@@ -210,7 +209,7 @@ fn apply_tile_streaming_frame(
     terrain: &TerrainElevation,
     origin: LocalOrigin,
     origin_changed: bool,
-    overlay_changed: bool,
+    debug: bool,
     selection: &TileSelection,
 ) {
     let terrain_rev = terrain.revision();
@@ -237,7 +236,7 @@ fn apply_tile_streaming_frame(
                 .copied()
                 .unwrap_or(CoarserEdges::NONE);
             let indices = render_state.index_table.indices(target_edges);
-            let terrain_mat = render_state.terrain_material_for(built.tile);
+            let terrain_mat = render_state.terrain_material_for(built.tile, debug);
             let water_mat = render_state.materials.water.clone();
             upload_built_tile(
                 commands,
@@ -308,13 +307,13 @@ fn apply_tile_streaming_frame(
         TileSyncFrame {
             origin,
             origin_changed,
-            overlay_changed,
+            overlay_changed: render_state.applied_debug_overlay != debug,
         },
         &render_state.visible_scratch,
-        |tile_id| render_state.terrain_material_for(tile_id),
+        |tile_id| render_state.terrain_material_for(tile_id, debug),
     );
     render_state.last_origin = Some(origin);
-    render_state.applied_debug_overlay = render_state.debug_overlay;
+    render_state.applied_debug_overlay = debug;
 
     evict_excess_tiles(commands, meshes, render_state, min_pinned_lod);
     render_state.all_desired_ready = selection

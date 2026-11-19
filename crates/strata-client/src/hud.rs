@@ -13,11 +13,12 @@ use crate::globe_render::GlobeRenderState;
 )]
 pub(crate) fn format_hud_into(
     out: &mut String,
+    debug: bool,
     frame: &SimulationSnapshot,
     active: Option<&AuthoritativePoint>,
     cam_state: &GlobeCameraState,
     origin_state: &OriginState,
-    render_state: &GlobeRenderState,
+    render_state: Option<&GlobeRenderState>,
     terrain_world: Option<&TerrainWorld>,
     auto_sweep: bool,
 ) {
@@ -37,16 +38,11 @@ pub(crate) fn format_hud_into(
         elapsed.as_secs() % 60,
         elapsed.subsec_millis(),
     );
-    let _ = writeln!(
+    write_renderer(
         out,
-        "Project Strata | Planet R = {:.0} km | Tick {} | Tiles {} / Cached {} / Pending {} (LOD {}..{})",
-        snapshot.planet.radius_meters() / 1_000.0,
+        snapshot.planet.radius_meters(),
         time.ticks(),
-        render_state.active_tile_count,
-        render_state.cached_tile_count,
-        render_state.pending_task_count,
-        render_state.min_lod,
-        render_state.max_lod,
+        render_state,
     );
     let blend = cam_state.orbital_blend();
     let view_mode = if blend >= 0.999 {
@@ -63,11 +59,7 @@ pub(crate) fn format_hud_into(
         cam_state.effective_pitch_rad().to_degrees(),
         origin_state.rebase_count,
         if auto_sweep { "ON" } else { "OFF" },
-        if render_state.debug_overlay {
-            "ON"
-        } else {
-            "OFF"
-        },
+        if debug { "ON" } else { "OFF" },
     );
     if let Some(world) = terrain_world {
         let sample = world.sample_terrain(cam_state.focus_unit);
@@ -82,19 +74,23 @@ pub(crate) fn format_hud_into(
         );
     }
     if let Some(pt) = active {
-        let tile_info = ecef_to_tile_uv(snapshot.planet, pt.position, render_state.max_lod)
-            .map_or_else(
-                |_| String::from("n/a"),
-                |(tile, _, _)| {
-                    format!(
-                        "{} L{} ({}, {})",
-                        tile.face.label(),
-                        tile.lod,
-                        tile.x,
-                        tile.y
-                    )
-                },
-            );
+        let tile_info = ecef_to_tile_uv(
+            snapshot.planet,
+            pt.position,
+            render_state.map_or(snapshot.planet.max_lod(), |state| state.max_lod),
+        )
+        .map_or_else(
+            |_| String::from("n/a"),
+            |(tile, _, _)| {
+                format!(
+                    "{} L{} ({}, {})",
+                    tile.face.label(),
+                    tile.lod,
+                    tile.x,
+                    tile.y
+                )
+            },
+        );
         let rel = origin_state.origin.to_render_vec3(pt.position);
         let _ = writeln!(
             out,
@@ -157,5 +153,32 @@ const fn biome_label(biome: Biome) -> &'static str {
         Biome::AlpineRock => "Alpine Rock",
         Biome::CoastalWetland => "Coastal Wetland",
         Biome::OpenWater => "Open Water",
+    }
+}
+
+fn write_renderer(
+    out: &mut String,
+    radius_m: f64,
+    tick: u64,
+    render_state: Option<&GlobeRenderState>,
+) {
+    let _ = write!(
+        out,
+        "Project Strata | Planet R = {:.0} km | Tick {} | ",
+        radius_m / 1_000.0,
+        tick
+    );
+    if let Some(render_state) = render_state {
+        let _ = writeln!(
+            out,
+            "CPU tiles {} / Cached {} / Pending {} (LOD {}..{})",
+            render_state.active_tile_count,
+            render_state.cached_tile_count,
+            render_state.pending_task_count,
+            render_state.min_lod,
+            render_state.max_lod
+        );
+    } else {
+        let _ = writeln!(out, "GPU terrain");
     }
 }

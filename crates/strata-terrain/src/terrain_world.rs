@@ -22,7 +22,7 @@ use crate::terrain_config::{DEFAULT_EARTH_SEED, TerrainConfig};
 pub struct TerrainWorld {
     pub(crate) config: TerrainConfig,
     pub(crate) seed: u64,
-    elevation_source: ElevationGridSource,
+    pub(crate) elevation_source: ElevationGridSource,
     pub(crate) hydrology: HydrologyIndex,
     pub(crate) macro_cache: CubeMacroCache,
     pub(crate) patches: PatchLayer,

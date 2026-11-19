@@ -2,7 +2,7 @@ use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 
 use crate::camera::{GlobeCameraState, MIN_ALTITUDE_METERS, ZoomCursorAnchor};
-use crate::globe_render::GlobeRenderState;
+use crate::globe_debug::TerrainDebug;
 use crate::snapshot::{ClientWorldView, SelectedPointState};
 use crate::terrain::TerrainElevation;
 
@@ -73,15 +73,15 @@ pub fn handle_camera_input(
     mut motion_events: MessageReader<MouseMotion>,
     world_view: Res<ClientWorldView>,
     terrain: Res<TerrainElevation>,
-    render_state: Option<ResMut<GlobeRenderState>>,
+    debug: Option<ResMut<TerrainDebug>>,
     mut gesture: ResMut<PointerGestureState>,
     mut selected: ResMut<SelectedPointState>,
     mut cam_state: ResMut<GlobeCameraState>,
 ) {
     if keys.just_pressed(KeyCode::KeyG)
-        && let Some(mut render_state) = render_state
+        && let Some(mut debug) = debug
     {
-        render_state.debug_overlay = !render_state.debug_overlay;
+        debug.0 = !debug.0;
     }
 
     let dt = f64::from(time.delta_secs()).min(0.1);

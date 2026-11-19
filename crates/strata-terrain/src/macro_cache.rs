@@ -53,7 +53,7 @@ pub(crate) struct CubeMacroCache {
     resolution: u32,
     lod_depth: u8,
     stride: usize,
-    vertices: Vec<MacroCell>,
+    pub(crate) vertices: Vec<MacroCell>,
     level_offsets: Vec<usize>,
     mip_nodes: Vec<MinMaxNode>,
     face_stride_mip: usize,

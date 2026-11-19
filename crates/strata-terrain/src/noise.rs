@@ -23,7 +23,7 @@ const GRADIENTS: [[f64; 3]; 16] = [
 
 /// Deterministic `SplitMix64` integer hash for 3D lattice coordinates.
 #[inline]
-const fn hash3(ix: i32, iy: i32, iz: i32, seed: u64) -> u64 {
+pub(crate) const fn hash3(ix: i32, iy: i32, iz: i32, seed: u64) -> u64 {
     let mut h = seed
         .wrapping_add(
             (ix as i64)
