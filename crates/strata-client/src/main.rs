@@ -2,10 +2,17 @@ mod camera;
 mod camera_controls;
 mod camera_sync;
 mod compass;
+mod globe_debug;
 mod globe_render;
 mod markers;
 mod snapshot;
 mod terrain;
+mod tile_cache;
+mod tile_mesh_build;
+mod tile_streaming;
+
+#[cfg(test)]
+mod terrain_render_tests;
 
 use std::sync::Arc;
 
@@ -17,7 +24,8 @@ use crate::camera::{GlobeCameraState, OriginState};
 use crate::camera_controls::{PointerGestureState, handle_camera_input};
 use crate::camera_sync::{setup_camera_and_lighting, update_camera_and_origin};
 use crate::compass::{setup_compass_ui, update_compass_ui};
-use crate::globe_render::{draw_cube_face_seams, setup_globe_materials, sync_globe_tiles};
+use crate::globe_debug::draw_cube_face_seams;
+use crate::globe_render::{setup_globe_materials, sync_globe_tiles};
 use crate::markers::{setup_markers_and_hud, sync_markers_and_hud};
 use crate::snapshot::{ClientWorldView, SelectedPointState, latch_world_snapshot};
 use crate::terrain::TerrainElevation;
@@ -28,15 +36,17 @@ fn main() -> AppExit {
     let channel = Arc::new(SnapshotChannel::new(initial_snapshot));
     let world_view = ClientWorldView::new(channel);
     let selected = SelectedPointState::default();
+    let terrain = TerrainElevation::earth_default();
 
     let focus_dir = selected
         .active_point(world_view.snapshot())
         .map_or(strata_globe::EcefMeters::from_raw(1.0, 1.0, 1.0), |p| {
             p.position
         });
-    let Ok(cam_state) = GlobeCameraState::new(planet, focus_dir) else {
+    let Ok(mut cam_state) = GlobeCameraState::new(planet, focus_dir) else {
         return AppExit::error();
     };
+    cam_state.sync_terrain_elevations(terrain.sampler());
     let (initial_eye, _, _) = cam_state.compute_pose_f64();
     let Ok(origin_state) = OriginState::new(initial_eye) else {
         return AppExit::error();
@@ -63,7 +73,7 @@ fn main() -> AppExit {
         .insert_resource(selected)
         .insert_resource(cam_state)
         .insert_resource(origin_state)
-        .init_resource::<TerrainElevation>()
+        .insert_resource(terrain)
         .init_resource::<PointerGestureState>()
         .add_systems(
             Startup,

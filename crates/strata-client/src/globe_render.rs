@@ -1,48 +1,66 @@
 use std::collections::{HashMap, HashSet};
 
-use bevy::asset::RenderAssetUsages;
-use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use strata_globe::{
-    CoarserEdges, EcefMeters, LocalOrigin, LodConfig, PlanetSpec, TileId, TileRenderMesh,
-    build_tile_render_mesh_with_elevation, select_tiles_with_elevation,
+    CoarserEdges, LocalOrigin, LodConfig, PlanetSpec, TileId, select_tiles_with_elevation,
 };
 
 use crate::camera::{GlobeCameraState, OriginState};
+use crate::globe_debug::build_tile_grid_image;
 use crate::snapshot::ClientWorldView;
-use crate::terrain::{TerrainElevation, sample_clamped_elevation};
+use crate::terrain::TerrainElevation;
+use crate::tile_cache::{
+    CachedTile, TileEntityQuery, TileSyncFrame, despawn_cached_tile, sync_tile_entities,
+    upload_built_tile,
+};
+use crate::tile_streaming::{TileAsyncQueue, TileStreamPlanner};
 
-/// Cached GPU tile mesh and metadata for a single visible [`TileId`].
-struct CachedTile {
-    entity: Entity,
-    mesh: Handle<Mesh>,
-    coarser_edges: CoarserEdges,
-    baked_origin: LocalOrigin,
-}
-
-/// Client-side tile mesh cache, LOD hysteresis set, and cube-face materials.
+/// Client-side tile mesh cache, async streaming queue, LOD hysteresis set, and materials.
 #[derive(Resource)]
 pub struct GlobeRenderState {
     tiles: HashMap<TileId, CachedTile>,
     previously_split: HashSet<TileId>,
+    stream_queue: TileAsyncQueue,
     baked_planet: Option<PlanetSpec>,
     baked_terrain_revision: Option<u64>,
+    last_origin: Option<LocalOrigin>,
+    applied_debug_overlay: bool,
+    frame_counter: u64,
+    terrain_material: Handle<StandardMaterial>,
+    water_material: Handle<StandardMaterial>,
     face_materials: [Handle<StandardMaterial>; 6],
     /// Current LOD configuration used by the client renderer.
     pub lod_config: LodConfig,
-    /// Number of tiles active on screen this frame.
+    /// Number of desired leaf tiles selected on screen this frame.
     pub active_tile_count: usize,
+    /// Total number of cached tiles currently resident in GPU memory.
+    pub cached_tile_count: usize,
+    /// Number of in-flight async background tile build tasks.
+    pub pending_task_count: usize,
     /// Minimum LOD among active tiles.
     pub min_lod: u8,
     /// Maximum LOD among active tiles.
     pub max_lod: u8,
+    /// When `true`, switches tiles to cube-face grid materials and renders seam gizmos.
+    pub debug_overlay: bool,
 }
 
 impl GlobeRenderState {
-    /// Initializes face materials with a procedural tile-grid texture so tile
-    /// boundaries, `L/L+1` stitching, and cube-face seams are visually inspectable.
     fn initialize(images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>) -> Self {
+        let terrain_material = materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.92,
+            reflectance: 0.12,
+            ..default()
+        });
+        let water_material = materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.16,
+            reflectance: 0.65,
+            metallic: 0.02,
+            ..default()
+        });
+
         let grid_texture = images.add(build_tile_grid_image());
         let face_colors = [
             Color::srgb(0.28, 0.48, 0.62), // +X
@@ -65,13 +83,30 @@ impl GlobeRenderState {
         Self {
             tiles: HashMap::new(),
             previously_split: HashSet::new(),
+            stream_queue: TileAsyncQueue::default(),
             baked_planet: None,
             baked_terrain_revision: None,
+            last_origin: None,
+            applied_debug_overlay: false,
+            frame_counter: 0,
+            terrain_material,
+            water_material,
             face_materials,
             lod_config: LodConfig::standard(),
             active_tile_count: 0,
+            cached_tile_count: 0,
+            pending_task_count: 0,
             min_lod: 0,
             max_lod: 0,
+            debug_overlay: false,
+        }
+    }
+
+    fn terrain_material_for(&self, tile: TileId) -> Handle<StandardMaterial> {
+        if self.debug_overlay {
+            self.face_materials[tile.face.index()].clone()
+        } else {
+            self.terrain_material.clone()
         }
     }
 }
@@ -86,7 +121,8 @@ pub fn setup_globe_materials(
     commands.insert_resource(state);
 }
 
-/// Synchronizes visible Bevy tile meshes with [`select_tiles_with_elevation`] and [`OriginState`].
+/// Synchronizes visible Bevy tile meshes asynchronously with [`select_tiles_with_elevation`]
+/// and updates tile entity transforms in `O(1)` when [`OriginState`] rebases.
 #[expect(
     clippy::too_many_arguments,
     clippy::needless_pass_by_value,
@@ -101,6 +137,7 @@ pub fn sync_globe_tiles(
     origin_state: Res<OriginState>,
     mut render_state: ResMut<GlobeRenderState>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut tile_query: TileEntityQuery<'_, '_>,
 ) {
     let (width_px, height_px) = windows.iter().next().map_or((1280.0_f64, 720.0_f64), |w| {
         (
@@ -108,23 +145,25 @@ pub fn sync_globe_tiles(
             f64::from(w.height()).max(1.0),
         )
     });
-    let aspect = width_px / height_px;
-    let Ok(cam_view) = cam_state.to_camera_view_f64(aspect, height_px) else {
+    let Ok(cam_view) = cam_state.to_camera_view_f64(width_px / height_px, height_px) else {
         return;
     };
 
+    render_state.frame_counter = render_state.frame_counter.wrapping_add(1);
     let planet = world_view.snapshot().planet;
     let terrain_rev = terrain.revision();
     if render_state.baked_planet != Some(planet)
         || render_state.baked_terrain_revision != Some(terrain_rev)
     {
-        for (_, removed) in render_state.tiles.drain() {
-            commands.entity(removed.entity).despawn();
-            meshes.remove(&removed.mesh);
+        let drained: Vec<CachedTile> = render_state.tiles.drain().map(|(_, v)| v).collect();
+        for cached in drained {
+            despawn_cached_tile(&mut commands, &mut meshes, cached);
         }
         render_state.previously_split.clear();
+        render_state.stream_queue.in_flight.clear();
         render_state.baked_planet = Some(planet);
         render_state.baked_terrain_revision = Some(terrain_rev);
+        render_state.last_origin = None;
     }
 
     let Ok(selection) = select_tiles_with_elevation(
@@ -137,6 +176,34 @@ pub fn sync_globe_tiles(
         return;
     };
 
+    apply_tile_streaming_frame(
+        &mut commands,
+        &mut meshes,
+        &mut render_state,
+        &mut tile_query,
+        planet,
+        &terrain,
+        origin_state.origin,
+        &selection,
+    );
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming synchronization coordinates ECS commands, mesh assets, tile queries, and terrain handles"
+)]
+fn apply_tile_streaming_frame(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    render_state: &mut GlobeRenderState,
+    tile_query: &mut TileEntityQuery<'_, '_>,
+    planet: PlanetSpec,
+    terrain: &TerrainElevation,
+    origin: LocalOrigin,
+    selection: &strata_globe::TileSelection,
+) {
+    let terrain_rev = terrain.revision();
+    let frame = render_state.frame_counter;
     render_state.active_tile_count = selection.tiles.len();
     render_state.min_lod = selection.min_lod_selected;
     render_state.max_lod = selection.max_lod_selected;
@@ -147,217 +214,84 @@ pub fn sync_globe_tiles(
         .map(|t| (t.id, t.coarser_edges))
         .collect();
 
-    // Despawn tiles no longer selected.
-    let stale_ids: Vec<TileId> = render_state
-        .tiles
-        .keys()
-        .copied()
-        .filter(|id| !desired.contains_key(id))
-        .collect();
-    for id in stale_ids {
-        if let Some(removed) = render_state.tiles.remove(&id) {
-            commands.entity(removed.entity).despawn();
-            meshes.remove(&removed.mesh);
-        }
-    }
-
-    // Spawn or rebuild tiles whose edge stitching or LocalOrigin changed.
-    let origin = origin_state.origin;
-    let sampler = terrain.sampler();
-    for selected in &selection.tiles {
-        let tile_id = selected.id;
-        let coarser = selected.coarser_edges;
-        if let Some(existing) = render_state.tiles.get_mut(&tile_id) {
-            if existing.coarser_edges != coarser || existing.baked_origin != origin {
-                let render_mesh = build_tile_render_mesh_with_elevation(
-                    planet, tile_id, coarser, origin, sampler,
-                );
-                if let Some(mut mesh_asset) = meshes.get_mut(&existing.mesh) {
-                    *mesh_asset = to_bevy_mesh(render_mesh);
-                }
-                existing.coarser_edges = coarser;
-                existing.baked_origin = origin;
-            }
-        } else {
-            let render_mesh =
-                build_tile_render_mesh_with_elevation(planet, tile_id, coarser, origin, sampler);
-            let mesh_handle = meshes.add(to_bevy_mesh(render_mesh));
-            let mat_handle = render_state.face_materials[tile_id.face.index()].clone();
-            let entity = commands
-                .spawn((
-                    Mesh3d(mesh_handle.clone()),
-                    MeshMaterial3d(mat_handle),
-                    Transform::IDENTITY,
-                ))
-                .id();
-            render_state.tiles.insert(
-                tile_id,
-                CachedTile {
-                    entity,
-                    mesh: mesh_handle,
-                    coarser_edges: coarser,
-                    baked_origin: origin,
-                },
+    render_state
+        .stream_queue
+        .prune_stale(&desired, planet, terrain_rev);
+    let completed = render_state.stream_queue.poll_completed(&selection.tiles);
+    for built in completed {
+        if built.revision == terrain_rev {
+            let terrain_mat = render_state.terrain_material_for(built.tile);
+            let water_mat = render_state.water_material.clone();
+            upload_built_tile(
+                commands,
+                meshes,
+                &mut render_state.tiles,
+                tile_query,
+                origin,
+                frame,
+                terrain_mat,
+                water_mat,
+                built,
             );
         }
     }
-}
 
-/// Draws great-circle cube-face edge highlights using `Gizmos` with altitude-aware
-/// subdivision and lift so 2-face seams and 3-face corners stay visible above the sphere
-/// both from orbit and at `20 m` local ground scale.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Bevy ECS system parameters require Res<T> by value"
-)]
-pub fn draw_cube_face_seams(
-    mut gizmos: Gizmos,
-    world_view: Res<ClientWorldView>,
-    terrain: Res<TerrainElevation>,
-    cam_state: Res<GlobeCameraState>,
-    origin_state: Res<OriginState>,
-) {
-    let planet = world_view.snapshot().planet;
-    let r = planet.radius_meters();
-    let min_r = 1.0_f64.min(r * 0.5);
-    let alt = cam_state.altitude_meters.max(1.0);
-    let origin = origin_state.origin;
-    let sampler = terrain.sampler();
-    let seam_color = Color::srgba(0.95, 0.78, 0.30, 0.55);
-
-    let edges: [(EcefMeters, EcefMeters); 12] = [
-        (
-            EcefMeters::from_raw(1.0, -1.0, -1.0),
-            EcefMeters::from_raw(1.0, 1.0, -1.0),
-        ),
-        (
-            EcefMeters::from_raw(1.0, -1.0, 1.0),
-            EcefMeters::from_raw(1.0, 1.0, 1.0),
-        ),
-        (
-            EcefMeters::from_raw(-1.0, -1.0, -1.0),
-            EcefMeters::from_raw(-1.0, 1.0, -1.0),
-        ),
-        (
-            EcefMeters::from_raw(-1.0, -1.0, 1.0),
-            EcefMeters::from_raw(-1.0, 1.0, 1.0),
-        ),
-        (
-            EcefMeters::from_raw(-1.0, 1.0, -1.0),
-            EcefMeters::from_raw(1.0, 1.0, -1.0),
-        ),
-        (
-            EcefMeters::from_raw(-1.0, 1.0, 1.0),
-            EcefMeters::from_raw(1.0, 1.0, 1.0),
-        ),
-        (
-            EcefMeters::from_raw(-1.0, -1.0, -1.0),
-            EcefMeters::from_raw(1.0, -1.0, -1.0),
-        ),
-        (
-            EcefMeters::from_raw(-1.0, -1.0, 1.0),
-            EcefMeters::from_raw(1.0, -1.0, 1.0),
-        ),
-        (
-            EcefMeters::from_raw(-1.0, -1.0, 1.0),
-            EcefMeters::from_raw(-1.0, -1.0, -1.0),
-        ),
-        (
-            EcefMeters::from_raw(1.0, -1.0, 1.0),
-            EcefMeters::from_raw(1.0, -1.0, -1.0),
-        ),
-        (
-            EcefMeters::from_raw(-1.0, 1.0, 1.0),
-            EcefMeters::from_raw(-1.0, 1.0, -1.0),
-        ),
-        (
-            EcefMeters::from_raw(1.0, 1.0, 1.0),
-            EcefMeters::from_raw(1.0, 1.0, -1.0),
-        ),
-    ];
-
-    let focus = cam_state.focus_unit;
-    let local_mode = alt < r * 0.02;
-    let segments = 64_u32;
-    let inv_seg = 1.0 / f64::from(segments);
-
-    for (a, b) in edges {
-        let dir = b - a;
-        let (t_min, t_max, lift) = if local_mode {
-            // Restrict subdivision to a local window around the focus projection so chord sagitta stays sub-millimeter.
-            let focus_cube = focus.scale(1.0 / focus.x.abs().max(focus.y.abs()).max(focus.z.abs()));
-            let t_proj = ((focus_cube - a).dot(dir) / dir.dot(dir)).clamp(0.0, 1.0);
-            let half_window = ((alt * 12.0) / r).clamp(1e-6, 0.5);
-            let lo = (t_proj - half_window).max(0.0);
-            let hi = (t_proj + half_window).min(1.0);
-            let closest = (a + dir.scale(t_proj)).normalized();
-            if let Ok(c_unit) = closest
-                && c_unit.distance_to(focus) * r > alt * 18.0
-            {
-                continue;
-            }
-            (lo, hi, (alt * 0.001).clamp(0.02, 10.0))
-        } else {
-            let seg_arc = planet.face_arc_length_meters() * inv_seg;
-            let sag = (seg_arc * seg_arc) / (8.0 * r);
-            (0.0, 1.0, sag + alt * 0.0015)
-        };
-
-        let mut prev = None;
-        for step in 0..=segments {
-            let t = t_min + (t_max - t_min) * (f64::from(step) * inv_seg);
-            let raw = a + dir.scale(t);
-            if let Ok(unit) = raw.normalized() {
-                let elev = sample_clamped_elevation(planet, unit, sampler);
-                let pt = origin.to_render_vec3(unit.scale((r + elev).max(min_r) + lift));
-                let v = Vec3::new(pt.x, pt.y, pt.z);
-                if let Some(p) = prev {
-                    gizmos.line(p, v, seam_color);
-                }
-                prev = Some(v);
-            }
-        }
-    }
-}
-
-fn to_bevy_mesh(tile_mesh: TileRenderMesh) -> Mesh {
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
+    let cached_edges: HashMap<TileId, CoarserEdges> = render_state
+        .tiles
+        .iter()
+        .map(|(&id, c)| (id, c.coarser_edges))
+        .collect();
+    let sampler_arc = terrain.sampler_arc();
+    let world_arc = terrain.world_arc();
+    render_state.stream_queue.dispatch_needed(
+        planet,
+        terrain_rev,
+        &selection.tiles,
+        &cached_edges,
+        &sampler_arc,
+        world_arc.as_ref(),
     );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, tile_mesh.positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, tile_mesh.normals);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, tile_mesh.uvs);
-    mesh.insert_indices(Indices::U32(tile_mesh.indices));
-    mesh
-}
 
-fn build_tile_grid_image() -> Image {
-    let size = 128_u32;
-    let mut data = Vec::with_capacity((size * size * 4) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            let is_outer_border = x <= 1 || y <= 1 || x >= size - 2 || y >= size - 2;
-            let is_subgrid = (x % 32 == 0) || (y % 32 == 0);
-            let shade: u8 = if is_outer_border {
-                245
-            } else if is_subgrid {
-                205
-            } else {
-                172
-            };
-            data.extend_from_slice(&[shade, shade, shade, 255]);
+    let ready: HashSet<TileId> = render_state.tiles.keys().copied().collect();
+    let visible = TileStreamPlanner::compute_visible_tiles(&selection.tiles, &ready);
+    for (&id, cached) in &mut render_state.tiles {
+        if visible.contains(&id) || desired.contains_key(&id) {
+            cached.last_used_frame = frame;
         }
     }
-    Image::new(
-        Extent3d {
-            width: size,
-            height: size,
-            depth_or_array_layers: 1,
+
+    let origin_changed = render_state.last_origin != Some(origin);
+    let overlay_changed = render_state.applied_debug_overlay != render_state.debug_overlay;
+    sync_tile_entities(
+        commands,
+        &render_state.tiles,
+        tile_query,
+        TileSyncFrame {
+            origin,
+            origin_changed,
+            overlay_changed,
         },
-        TextureDimension::D2,
-        data,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
-    )
+        &visible,
+        |tile_id| render_state.terrain_material_for(tile_id),
+    );
+    render_state.last_origin = Some(origin);
+    render_state.applied_debug_overlay = render_state.debug_overlay;
+
+    let last_used: HashMap<TileId, u64> = render_state
+        .tiles
+        .iter()
+        .map(|(&id, c)| (id, c.last_used_frame))
+        .collect();
+    let evictions = render_state
+        .stream_queue
+        .planner
+        .plan_evictions(&last_used, &visible);
+    for evict_id in evictions {
+        if let Some(removed) = render_state.tiles.remove(&evict_id) {
+            despawn_cached_tile(commands, meshes, removed);
+        }
+    }
+
+    render_state.cached_tile_count = render_state.tiles.len();
+    render_state.pending_task_count = render_state.stream_queue.in_flight.len();
 }

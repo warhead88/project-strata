@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 
 use bevy::prelude::*;
 use strata_globe::{ControlPointKind, PointId, ecef_to_tile_uv};
+use strata_terrain::{Biome, TerrainWorld, WaterBodyKind};
 
 use crate::camera::{GlobeCameraState, OriginState};
 use crate::globe_render::GlobeRenderState;
@@ -177,6 +178,7 @@ pub fn sync_markers_and_hud(
             &cam_state,
             &origin_state,
             &render_state,
+            terrain.world().map(std::sync::Arc::as_ref),
             selected.auto_sweep,
         );
     }
@@ -233,15 +235,18 @@ fn format_hud(
     cam_state: &GlobeCameraState,
     origin_state: &OriginState,
     render_state: &GlobeRenderState,
+    terrain_world: Option<&TerrainWorld>,
     auto_sweep: bool,
 ) -> String {
-    let mut out = String::with_capacity(512);
+    let mut out = String::with_capacity(640);
     let _ = writeln!(
         out,
-        "Project Strata | Planet R = {:.0} km | Tick {} | Tiles {} (LOD {}..{})",
+        "Project Strata | Planet R = {:.0} km | Tick {} | Tiles {} / Cached {} / Pending {} (LOD {}..{})",
         snapshot.planet.radius_meters() / 1_000.0,
         snapshot.tick,
         render_state.active_tile_count,
+        render_state.cached_tile_count,
+        render_state.pending_task_count,
         render_state.min_lod,
         render_state.max_lod,
     );
@@ -255,12 +260,29 @@ fn format_hud(
     };
     let _ = writeln!(
         out,
-        "Altitude: {:.1} m | View: {view_mode} (pitch {:.1} deg) | Rebases: {} | Sweep: {}",
+        "Altitude: {:.1} m | View: {view_mode} (pitch {:.1} deg) | Rebases: {} | Sweep: {} | Debug (G): {}",
         cam_state.altitude_meters,
         cam_state.effective_pitch_rad().to_degrees(),
         origin_state.rebase_count,
         if auto_sweep { "ON" } else { "OFF" },
+        if render_state.debug_overlay {
+            "ON"
+        } else {
+            "OFF"
+        },
     );
+    if let Some(world) = terrain_world {
+        let sample = world.sample_terrain(cam_state.focus_unit);
+        let water_desc = format_water_status(world, &sample.water);
+        let _ = writeln!(
+            out,
+            "Terrain: Elev {:+.1} m | Biome: {} | Water: {} | Province: {}",
+            sample.elevation_m,
+            biome_label(sample.biome),
+            water_desc,
+            sample.province.label(),
+        );
+    }
     if let Some(pt) = active {
         let tile_info = ecef_to_tile_uv(snapshot.planet, pt.position, render_state.max_lod)
             .map_or_else(
@@ -294,7 +316,49 @@ fn format_hud(
     }
     let _ = write!(
         out,
-        "Controls: Wheel/+-/PgUpDn Zoom-to-Cursor | MMB/WASD/Arrows Pan | RMB/Alt+MMB/Q-E Rotate+Tilt | N/Home/Compass North | 1-7/Tab Point | P/L/R"
+        "Controls: Wheel/+-/PgUpDn Zoom-to-Cursor | MMB/WASD/Arrows Pan | RMB/Alt+MMB/Q-E Rotate+Tilt | N/Home/Compass North | 1-7/Tab Point | P/L/R | G Debug"
     );
     out
+}
+
+fn format_water_status(world: &TerrainWorld, water: &strata_terrain::WaterSample) -> String {
+    match water.kind {
+        WaterBodyKind::Dry => String::from("Dry"),
+        WaterBodyKind::Ocean => format!("Ocean (depth {:.1} m)", water.depth_m),
+        WaterBodyKind::Lake(id) => {
+            let name = world
+                .lakes()
+                .iter()
+                .find(|l| l.id == id)
+                .map_or("Lake", |l| l.name);
+            format!("Lake: {name} (depth {:.1} m)", water.depth_m)
+        }
+        WaterBodyKind::River(id) => {
+            let name = world
+                .rivers()
+                .iter()
+                .find(|r| r.id == id)
+                .map_or("River", |r| r.name);
+            format!("River: {name} (depth {:.1} m)", water.depth_m)
+        }
+    }
+}
+
+const fn biome_label(biome: Biome) -> &'static str {
+    match biome {
+        Biome::PolarIce => "Polar Ice",
+        Biome::Tundra => "Tundra",
+        Biome::BorealForest => "Boreal Forest",
+        Biome::TemperateForest => "Temperate Forest",
+        Biome::TemperateGrassland => "Temperate Grassland",
+        Biome::Steppe => "Steppe",
+        Biome::HotDesert => "Hot Desert",
+        Biome::ColdDesert => "Cold Desert",
+        Biome::Savanna => "Savanna",
+        Biome::TropicalRainforest => "Tropical Rainforest",
+        Biome::AlpineTundra => "Alpine Tundra",
+        Biome::AlpineRock => "Alpine Rock",
+        Biome::CoastalWetland => "Coastal Wetland",
+        Biome::OpenWater => "Open Water",
+    }
 }
