@@ -10,7 +10,8 @@ rust-version = "1.97.1"
 publish = false
 
 [workspace.dependencies]
-bevy = { version = "0.20.1", default-features = false, features = ["2d"] }
+bevy = { version = "0.20.1", default-features = false, features = ["3d", "ui"] }
+strata-globe = { path = "crates/strata-globe" }
 
 [workspace.lints.rust]
 warnings = "deny"
