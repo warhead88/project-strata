@@ -16,6 +16,7 @@
 
 | Что меняется | Где начать |
 |---|---|
+| Стиль Rust, линты, коммиты и работа через GitHub | [Правила разработки](docs/development.md) |
 | Окно Bevy и запуск приложения | [Точка входа клиента](crates/strata-client/src/main.rs) |
 | Проверки workspace и ограничения файлов | [Команды xtask](crates/xtask/src/main.rs), [проверка размеров](crates/xtask/src/limits.rs) |
 | Связь симуляции с клиентом, публикация состояния | [Контракт двух направлений](docs/simulation-and-rendering.md#контракт-двух-направлений) |
