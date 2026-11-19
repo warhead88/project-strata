@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 use strata_globe::{CameraViewF64, EcefMeters, ElevationSampler, FlatElevation, PlanetSpec};
+use strata_terrain::TerrainWorld;
 
 /// Client-side terrain relief sampler resource with monotonic revision tracking
 /// so changing terrain invalidates cached GPU tile meshes cleanly.
 #[derive(Resource, Clone)]
 pub struct TerrainElevation {
     sampler: Arc<dyn ElevationSampler>,
+    world: Option<Arc<TerrainWorld>>,
     revision: u64,
 }
 
@@ -17,8 +19,26 @@ impl TerrainElevation {
     pub fn new(sampler: Arc<dyn ElevationSampler>) -> Self {
         Self {
             sampler,
+            world: None,
             revision: 0,
         }
+    }
+
+    /// Creates a [`TerrainElevation`] backed by a full physical-geographic [`TerrainWorld`].
+    #[must_use]
+    pub fn from_world(world: Arc<TerrainWorld>) -> Self {
+        let sampler: Arc<dyn ElevationSampler> = world.clone();
+        Self {
+            sampler,
+            world: Some(world),
+            revision: 0,
+        }
+    }
+
+    /// Creates a [`TerrainElevation`] initialized with [`TerrainWorld::earth_default`].
+    #[must_use]
+    pub fn earth_default() -> Self {
+        Self::from_world(Arc::new(TerrainWorld::earth_default()))
     }
 
     /// Active terrain elevation sampler.
@@ -27,19 +47,49 @@ impl TerrainElevation {
         self.sampler.as_ref()
     }
 
-    /// Monotonic revision incremented whenever [`Self::set_sampler`] replaces the sampler.
+    /// Cloned [`Arc<dyn ElevationSampler>`] handle for background mesh generation tasks.
+    #[must_use]
+    pub(crate) fn sampler_arc(&self) -> Arc<dyn ElevationSampler> {
+        Arc::clone(&self.sampler)
+    }
+
+    /// Active [`TerrainWorld`] if this terrain carries full hydrology, climate, and biome data.
+    #[must_use]
+    pub fn world(&self) -> Option<&Arc<TerrainWorld>> {
+        self.world.as_ref()
+    }
+
+    /// Cloned optional [`Arc<TerrainWorld>`] handle for background mesh generation tasks.
+    #[must_use]
+    pub(crate) fn world_arc(&self) -> Option<Arc<TerrainWorld>> {
+        self.world.as_ref().map(Arc::clone)
+    }
+
+    /// Monotonic revision incremented whenever [`Self::set_sampler`] or [`Self::set_world`] replaces the terrain.
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
     }
 
-    /// Replaces the active elevation sampler and bumps the cache-invalidation revision.
+    /// Replaces the active elevation sampler (clearing any [`TerrainWorld`]) and bumps the revision.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "runtime terrain-switching API exercised by tests")
     )]
     pub fn set_sampler(&mut self, sampler: Arc<dyn ElevationSampler>) {
         self.sampler = sampler;
+        self.world = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Replaces the active terrain with `world` and bumps the cache-invalidation revision.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "runtime terrain-switching API exercised by tests")
+    )]
+    pub fn set_world(&mut self, world: Arc<TerrainWorld>) {
+        self.sampler = world.clone();
+        self.world = Some(world);
         self.revision = self.revision.wrapping_add(1);
     }
 }

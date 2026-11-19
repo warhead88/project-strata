@@ -9,6 +9,7 @@ publish.workspace = true
 bevy.workspace = true
 strata-globe.workspace = true
 strata-simulation.workspace = true
+strata-terrain.workspace = true
 
 [lints]
 workspace = true
