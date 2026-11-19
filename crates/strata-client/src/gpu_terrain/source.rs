@@ -21,6 +21,7 @@ pub(super) struct SourceSettings {
     pub(super) frequencies: [u32; 2],
 }
 
+#[derive(Clone)]
 pub(super) struct SourceGpu {
     pub(super) settings: SourceSettings,
     pub(super) bounds: Buffer,
@@ -76,29 +77,22 @@ impl SourceGpu {
             TextureFormat::Rgba32Float,
             &fields,
         );
-        let [(f0, mut gradients), (f1, second_octave)] = data.detail_lattices();
-        let second_octave_offset = u32::try_from(gradients.len()).ok()?;
-        gradients.extend(second_octave);
-        let gradients = initialized(
-            device,
-            "Terrain noise gradients",
-            BufferUsages::STORAGE,
-            &gradients,
-        );
+        let octaves = data.detail_octaves();
+        let gradients = super::gradients::generate(device, queue, octaves);
         let bounds = upload_bounds(device, data, resolution);
         let (buckets, features) = upload_hydrology(device, data);
         Some(Self {
             settings: SourceSettings {
                 macro_resolution: resolution,
-                second_octave_offset,
+                second_octave_offset: gradients.second_octave_offset,
                 bucket_dim: u32::try_from(HYDROLOGY_BUCKET_DIM).ok()?,
                 pixel_centered,
-                frequencies: [f0, f1],
+                frequencies: octaves.map(|(frequency, _)| frequency),
             },
             bounds,
             buckets,
             features,
-            gradients,
+            gradients: gradients.buffer,
             dem,
             climate,
         })

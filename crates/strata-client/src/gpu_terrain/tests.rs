@@ -1,3 +1,4 @@
+mod gradients;
 mod selection;
 
 use bevy::render::{
@@ -65,7 +66,32 @@ fn native_gpu_terrain_matches_world_and_stitches_balanced_selection()
     ));
     println!("GPU test on {} ({:?})", info.name, info.backend);
     let input = input(33.45, 45.0, 20.0)?;
-    let gpu = TerrainGpu::new(&device, &queue, &input).ok_or("terrain upload failed")?;
+    let world = input.terrain.world().ok_or("test world missing")?;
+    let data = world.surface_data().ok_or("test surface missing")?;
+    let source = SourceGpu::upload(&device, &queue, &data).ok_or("test upload failed")?;
+    gradients::validate(
+        &device,
+        &queue,
+        data.detail_octaves(),
+        &source.gradients,
+        source.settings.second_octave_offset,
+    )?;
+    let wrapped_seed_octaves = [(3, u64::MAX - 3), (2, 0x8000_0000_ffff_ffff)];
+    let wrapped = super::gradients::generate(&device, &queue, wrapped_seed_octaves);
+    gradients::validate(
+        &device,
+        &queue,
+        wrapped_seed_octaves,
+        &wrapped.buffer,
+        wrapped.second_octave_offset,
+    )?;
+    let gpu = TerrainGpu::new(
+        &device,
+        input.camera.planet,
+        input.terrain.revision(),
+        source,
+    )
+    .ok_or("terrain GPU allocation failed")?;
     validate_surface(&device, &queue, &input, &gpu)?;
     selection::validate(&device, &queue, &input, &gpu)?;
     Ok(())
@@ -96,8 +122,7 @@ fn validate_surface(
     terrain: &TerrainGpu,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let world = input.terrain.world().ok_or("test world missing")?;
-    let surface = world.surface_data().ok_or("test surface missing")?;
-    let source = SourceGpu::upload(device, queue, &surface).ok_or("test source upload failed")?;
+    let source = &terrain.source;
     let (eye, _, _) = input.camera.compute_pose_f64();
     let coords = probe_points(world, &input.camera, eye)?;
     let points: Vec<_> = coords
@@ -133,7 +158,7 @@ fn validate_surface(
         BufferUsages::COPY_DST | BufferUsages::MAP_READ,
     );
     let (world_layout, world_group) =
-        surface_group(device, &terrain.frame, &source, ShaderStages::COMPUTE);
+        surface_group(device, &terrain.frame, source, ShaderStages::COMPUTE);
     let (probe_layout, probe_group) = storage_group(
         device,
         "Terrain probe",
@@ -283,4 +308,43 @@ fn read<T: Pod>(
     let data = bytemuck::cast_slice(&slice.get_mapped_range()?).to_vec();
     readback.unmap();
     Ok(data)
+}
+
+#[test]
+#[ignore = "measures release source preparation on a native adapter"]
+fn native_gpu_source_preparation() -> Result<(), Box<dyn std::error::Error>> {
+    let settings = WgpuSettings::default();
+    let RenderResources(device, queue, info, ..) = bevy::tasks::block_on(initialize_renderer(
+        settings.backends.unwrap_or(Backends::PRIMARY),
+        None,
+        &settings,
+    ));
+    println!("Source preparation on {} ({:?})", info.name, info.backend);
+    let world = strata_terrain::TerrainWorld::earth_default();
+    let source = world.surface_data().ok_or("test surface missing")?;
+    let mut cpu = Vec::new();
+    let mut total = Vec::new();
+    for run in 0..9 {
+        let start = std::time::Instant::now();
+        let resident = SourceGpu::upload(&device, &queue, &source).ok_or("source upload failed")?;
+        let cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
+        queue.submit([]);
+        device.poll(PollType::wait_indefinitely())?;
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if run == 0 {
+            println!("cold CPU {cpu_ms:.3} ms, ready {total_ms:.3} ms");
+        } else {
+            cpu.push(cpu_ms);
+            total.push(total_ms);
+        }
+        drop(resident);
+    }
+    cpu.sort_by(f64::total_cmp);
+    total.sort_by(f64::total_cmp);
+    println!(
+        "warm medians CPU {:.3} ms, ready {:.3} ms",
+        f64::midpoint(cpu[3], cpu[4]),
+        f64::midpoint(total[3], total[4])
+    );
+    Ok(())
 }

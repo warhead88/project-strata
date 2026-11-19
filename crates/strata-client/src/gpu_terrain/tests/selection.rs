@@ -19,7 +19,7 @@ pub(super) fn validate(
         2 * DRAW_BYTES + tile_bytes,
         BufferUsages::COPY_DST | BufferUsages::MAP_READ,
     );
-    let mut frame = input.frame(Mat4::ZERO, 623.0, terrain.source);
+    let mut frame = input.frame(Mat4::ZERO, 623.0, terrain.source.settings);
     frame.planet[1] = frame.planet[2]; // no horizon cull, validate coverage of the complete sphere
     queue.write_buffer(&terrain.frame, 0, bytes_of(&frame));
     let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
@@ -94,7 +94,7 @@ pub(super) fn validate(
             .rotation
             .inverse(),
     );
-    let visible = input.frame(projection * rotation, 623.0, terrain.source);
+    let visible = input.frame(projection * rotation, 623.0, terrain.source.settings);
     let visible_count = selected_counts(device, queue, terrain, &visible)?[0];
     assert!(visible_count > 0 && visible_count < data[1]);
     println!("Camera frustum and horizon retained {visible_count} of {count} leaves");

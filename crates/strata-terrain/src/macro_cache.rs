@@ -13,6 +13,9 @@ use crate::noise::noise3;
 /// Default per-face macro cache cell resolution (`6 x 128 x 128` cells).
 pub const DEFAULT_MACRO_RESOLUTION: u32 = 128;
 
+/// Frequency and wrapping seed offset for each octave of the shared surface detail.
+pub(crate) const DETAIL_OCTAVES: [(u32, u64); 2] = [(64, 701), (140, 911)];
+
 /// Maximum amplitude of fast 2-octave micro-detail noise at `roughness == 1.0`.
 pub(crate) const MICRO_MAX_BOUND_M: f64 = 160.0;
 
@@ -260,18 +263,10 @@ pub(crate) fn micro_detail_fast(
     }
     let t = (dem_elev_m * 0.025).min(1.0);
     let coast_taper = t * t * (3.0 - 2.0 * t);
-    let n0 = noise3(
-        unit_dir.x * 64.0,
-        unit_dir.y * 64.0,
-        unit_dir.z * 64.0,
-        seed.wrapping_add(701),
-    );
-    let n1 = noise3(
-        unit_dir.x * 140.0,
-        unit_dir.y * 140.0,
-        unit_dir.z * 140.0,
-        seed.wrapping_add(911),
-    );
+    let [n0, n1] = DETAIL_OCTAVES.map(|(frequency, offset)| {
+        let p = unit_dir.scale(f64::from(frequency));
+        noise3(p.x, p.y, p.z, seed.wrapping_add(offset))
+    });
     let f = n0 * 0.68 + n1 * 0.32;
     roughness * coast_taper * MICRO_MAX_BOUND_M * f
 }

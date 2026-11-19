@@ -2,7 +2,7 @@ use strata_globe::{CubeFace, TileId};
 
 use crate::earth_geography::ElevationGridSource;
 use crate::hydrology_index::BUCKET_DIM;
-use crate::noise::hash3;
+use crate::macro_cache::DETAIL_OCTAVES;
 use crate::{LakeDef, MacroCell, RiverWaypoint, TerrainPatchKind, TerrainWorld};
 
 /// Hydrology bins per cube-face axis.
@@ -71,34 +71,11 @@ impl<'a> SurfaceData<'a> {
         (self.0.macro_resolution(), &self.0.macro_cache.vertices)
     }
 
-    /// Returns the two octave frequencies and packed gradient indices used by the height model.
-    /// Each nibble represents one lattice vertex, in x-major order from `-freq` to `+freq`
-    /// inclusive on all axes. Indices select the gradients used by `noise3`.
+    /// Returns each detail octave's lattice frequency and effective seed.
+    /// The signed coordinate range on each axis is `-frequency..=frequency`.
     #[must_use]
-    pub fn detail_lattices(&self) -> [(u32, Vec<u32>); 2] {
-        [(64, 701), (140, 911)].map(|(freq, offset)| {
-            let seed = self.0.seed.wrapping_add(offset);
-            let mut values = Vec::new();
-            let mut word = 0;
-            let mut shift = 0;
-            for z in -freq..=freq {
-                for y in -freq..=freq {
-                    for x in -freq..=freq {
-                        word |= ((hash3(x, y, z, seed) & 15) as u32) << shift;
-                        shift += 4;
-                        if shift == 32 {
-                            values.push(word);
-                            word = 0;
-                            shift = 0;
-                        }
-                    }
-                }
-            }
-            if shift != 0 {
-                values.push(word);
-            }
-            (freq.unsigned_abs(), values)
-        })
+    pub fn detail_octaves(&self) -> [(u32, u64); 2] {
+        DETAIL_OCTAVES.map(|(frequency, offset)| (frequency, self.0.seed.wrapping_add(offset)))
     }
 
     /// Returns the source's conservative height bounds at the requested tile (meters).

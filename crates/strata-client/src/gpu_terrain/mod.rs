@@ -1,3 +1,4 @@
+mod gradients;
 mod pipeline;
 mod source;
 #[cfg(test)]
@@ -25,7 +26,7 @@ use strata_globe::PlanetSpec;
 use crate::{camera::GlobeCameraState, globe_debug::TerrainDebug, terrain::TerrainElevation};
 
 use self::pipeline::{DrawPipelines, SelectPipeline};
-use self::source::{SourceGpu, SourceSettings, grid_indices, initialized};
+use self::source::{SourceGpu, grid_indices, initialized};
 use self::view::GpuView;
 
 #[derive(Resource)]
@@ -130,7 +131,7 @@ const DRAW_BYTES: u64 = 20;
 
 #[derive(Resource)]
 struct TerrainGpu {
-    source: SourceSettings,
+    source: SourceGpu,
     frame: Buffer,
     indirect: Buffer,
     indices: Buffer,
@@ -143,8 +144,12 @@ struct TerrainGpu {
 }
 
 impl TerrainGpu {
-    fn new(device: &RenderDevice, queue: &RenderQueue, input: &ExtractedTerrain) -> Option<Self> {
-        let source = SourceGpu::upload(device, queue, &input.terrain.world()?.surface_data()?)?;
+    fn new(
+        device: &RenderDevice,
+        planet: PlanetSpec,
+        revision: u64,
+        source: SourceGpu,
+    ) -> Option<Self> {
         let frame = allocate(
             device,
             "Terrain camera",
@@ -172,7 +177,7 @@ impl TerrainGpu {
             TILE_CAPACITY * 16,
             BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         );
-        let index_data = grid_indices(input.camera.planet.grid_segments());
+        let index_data = grid_indices(planet.grid_segments());
         let index_count = u32::try_from(index_data.len()).ok()?;
         let indices = initialized(
             device,
@@ -189,7 +194,7 @@ impl TerrainGpu {
         let selection = SelectPipeline::new(device, &frame, &source, &indirect, &land, &water);
         let drawing = DrawPipelines::new(device, &frame, &source, &land, &water);
         Some(Self {
-            source: source.settings,
+            source,
             frame,
             indirect,
             indices,
@@ -198,7 +203,7 @@ impl TerrainGpu {
             reset,
             selection,
             drawing,
-            key: (input.camera.planet, input.terrain.revision()),
+            key: (planet, revision),
         })
     }
     fn encode_selection(
@@ -246,7 +251,12 @@ fn prepare_terrain(
     if gpu.as_ref().is_some_and(|gpu| gpu.key == key) {
         return;
     }
-    if let Some(gpu) = TerrainGpu::new(&device, &queue, &input) {
+    let source = gpu
+        .as_ref()
+        .filter(|gpu| gpu.key.1 == key.1)
+        .map(|gpu| gpu.source.clone())
+        .or_else(|| SourceGpu::upload(&device, &queue, &input.terrain.world()?.surface_data()?));
+    if let Some(gpu) = source.and_then(|source| TerrainGpu::new(&device, key.0, key.1, source)) {
         commands.insert_resource(gpu);
     } else {
         error!("Could not upload GPU terrain source");
@@ -280,7 +290,7 @@ fn render_terrain(
         let device = context.render_device();
         [false, true].map(|water| gpu.drawing.create(device, format, samples, water))
     });
-    let frame = input.view(camera, view, gpu.source);
+    let frame = input.view(camera, view, gpu.source.settings);
     queue.write_buffer(&gpu.frame, 0, bytes_of(&frame));
     let diagnostics = context.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
