@@ -1,6 +1,7 @@
 //! Authoritative game time and coherent world publication, without a rendering dependency.
 
 mod clock;
+mod game_time;
 mod snapshot;
 
 use std::error::Error;
@@ -10,8 +11,9 @@ use std::time::Duration;
 
 use strata_globe::GlobeSnapshot;
 
+pub use crate::clock::TickInterval;
 use crate::clock::WallPacer;
-pub use crate::clock::{GameTime, TICK_DURATION, TickInterval};
+pub use crate::game_time::{GameDuration, GameTime, GameTimeError, TICK_DURATION};
 pub use crate::snapshot::{ClockStatus, SimulationSnapshot, SnapshotReader};
 
 /// Rejected clock advancement or world confirmation.
@@ -155,10 +157,9 @@ impl Simulation {
         if interval.epoch != self.world.epoch {
             return Err(SimulationError::WrongWorldEpoch);
         }
-        if interval.start != self.confirmed
-            || interval.end <= interval.start
-            || interval.end > self.wall.target
-        {
+        if !self.pending_interval().is_some_and(|pending| {
+            interval.start == pending.start && pending.contains(interval.end)
+        }) {
             return Err(SimulationError::InvalidConfirmation);
         }
         if let Some(mut world) = world {
