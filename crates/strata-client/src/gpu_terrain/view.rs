@@ -90,7 +90,12 @@ impl ExtractedTerrain {
                 source.bucket_dim,
                 source.frequencies[0],
             ],
-            detail: [source.frequencies[1], 0, 0, 0],
+            detail: [
+                source.frequencies[1],
+                source.hydrology_radius_m.to_bits(),
+                0,
+                0,
+            ],
             material_origin: [
                 eye.x.rem_euclid(256.0),
                 eye.y.rem_euclid(256.0),

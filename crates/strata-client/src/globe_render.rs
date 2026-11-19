@@ -9,8 +9,8 @@ use strata_globe::{
 use crate::camera::{GlobeCameraState, OriginState};
 use crate::globe_debug::TerrainDebug;
 use crate::globe_materials::{GlobeMaterials, SelectionKey};
-use crate::snapshot::ClientWorldView;
 use crate::terrain::TerrainElevation;
+use crate::terrain_backend::TerrainBackend;
 use crate::tile_async_queue::TileAsyncQueue;
 use crate::tile_cache::{
     CachedTile, StitchedIndexTable, TileEntityQuery, TileSyncFrame, despawn_cached_tile,
@@ -83,19 +83,38 @@ impl GlobeRenderState {
         }
     }
 
+    fn clear_surface(&mut self, commands: &mut Commands, meshes: &mut Assets<Mesh>) {
+        self.stream_queue.cancel_all();
+        for (_, tile) in self.tiles.drain() {
+            despawn_cached_tile(commands, meshes, tile);
+        }
+    }
+
     fn terrain_material_for(&self, tile: TileId, debug: bool) -> Handle<StandardMaterial> {
         self.materials.terrain_for(tile, debug)
     }
 }
 
-/// Startup system initializing tile materials and render cache.
-pub fn setup_globe_materials(
+/// Installs or retires the CPU tile cache when the selected backend changes.
+#[expect(clippy::needless_pass_by_value, reason = "Bevy system parameters")]
+pub(crate) fn reconcile_cpu_terrain(
     mut commands: Commands,
+    backend: Res<TerrainBackend>,
+    state: Option<ResMut<GlobeRenderState>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    let state = GlobeRenderState::initialize(&mut images, &mut materials);
-    commands.insert_resource(state);
+    match (backend.uses_gpu(), state) {
+        (false, None) => {
+            commands.insert_resource(GlobeRenderState::initialize(&mut images, &mut materials));
+        }
+        (true, Some(mut state)) => {
+            state.clear_surface(&mut commands, &mut meshes);
+            commands.remove_resource::<GlobeRenderState>();
+        }
+        (false, Some(_)) | (true, None) => {}
+    }
 }
 
 /// Synchronizes visible Bevy tile meshes asynchronously with [`select_tiles_with_elevation`]
@@ -108,7 +127,6 @@ pub fn setup_globe_materials(
 pub fn sync_globe_tiles(
     mut commands: Commands,
     windows: Query<&Window>,
-    world_view: Res<ClientWorldView>,
     terrain: Res<TerrainElevation>,
     cam_state: Res<GlobeCameraState>,
     origin_state: Res<OriginState>,
@@ -127,17 +145,13 @@ pub fn sync_globe_tiles(
         return;
     };
 
-    let planet = world_view.snapshot().planet;
+    let planet = cam_state.planet;
     let terrain_rev = terrain.revision();
     if render_state.baked_planet != Some(planet)
         || render_state.baked_terrain_revision != Some(terrain_rev)
     {
-        let drained: Vec<CachedTile> = render_state.tiles.drain().map(|(_, v)| v).collect();
-        for cached in drained {
-            despawn_cached_tile(&mut commands, &mut meshes, cached);
-        }
+        render_state.clear_surface(&mut commands, &mut meshes);
         render_state.previously_split.clear();
-        render_state.stream_queue.cancel_all();
         if render_state.index_table.grid_segments() != planet.grid_segments() {
             render_state.index_table = StitchedIndexTable::new(planet.grid_segments());
         }

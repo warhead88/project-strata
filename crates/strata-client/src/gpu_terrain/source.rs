@@ -19,6 +19,7 @@ pub(super) struct SourceSettings {
     pub(super) bucket_dim: u32,
     pub(super) pixel_centered: u32,
     pub(super) frequencies: [u32; 2],
+    pub(super) hydrology_radius_m: f32,
 }
 
 #[derive(Clone)]
@@ -88,6 +89,7 @@ impl SourceGpu {
                 bucket_dim: u32::try_from(HYDROLOGY_BUCKET_DIM).ok()?,
                 pixel_centered,
                 frequencies: octaves.map(|(frequency, _)| frequency),
+                hydrology_radius_m: meters_f32(data.hydrology_radius_m()),
             },
             bounds,
             buckets,

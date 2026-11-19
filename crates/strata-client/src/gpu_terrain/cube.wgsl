@@ -28,6 +28,7 @@ struct View {
     settings: vec4<u32>,
     // Macro grid resolution, next noise lattice offset (words), hydrology bins/axis.
     source: vec4<u32>,
+    // Second octave frequency and the source world radius as f32 bits.
     detail: vec4<u32>,
     material_origin: vec4<f32>,
 }

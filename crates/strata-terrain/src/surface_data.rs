@@ -48,6 +48,12 @@ impl TerrainWorld {
 }
 
 impl<'a> SurfaceData<'a> {
+    /// Returns the radius in meters used by the source world's hydrology.
+    #[must_use]
+    pub const fn hydrology_radius_m(&self) -> f64 {
+        self.0.planet().radius_meters()
+    }
+
     /// Returns the raster dimensions and height samples.
     #[must_use]
     pub fn raster(&self) -> (usize, usize, SurfaceRaster<'a>) {

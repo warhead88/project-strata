@@ -1,5 +1,6 @@
 mod gradients;
 mod selection;
+mod transition;
 
 use bevy::render::{
     render_resource::{
@@ -85,13 +86,8 @@ fn native_gpu_terrain_matches_world_and_stitches_balanced_selection()
         &wrapped.buffer,
         wrapped.second_octave_offset,
     )?;
-    let gpu = TerrainGpu::new(
-        &device,
-        input.camera.planet,
-        input.terrain.revision(),
-        source,
-    )
-    .ok_or("terrain GPU allocation failed")?;
+    let gpu = TerrainGpu::new(&device, input.camera.planet, source)
+        .ok_or("terrain GPU allocation failed")?;
     validate_surface(&device, &queue, &input, &gpu)?;
     selection::validate(&device, &queue, &input, &gpu)?;
     Ok(())

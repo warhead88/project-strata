@@ -17,71 +17,42 @@ use bevy::render::{
         Buffer, BufferDescriptor, BufferUsages, CommandEncoder, ComputePassDescriptor, IndexFormat,
         RenderPassDescriptor, RenderPipeline, StoreOp, TextureFormat,
     },
-    renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQueue, ViewQuery},
+    renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
     view::{ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget},
 };
 use bytemuck::bytes_of;
 use strata_globe::PlanetSpec;
 
-use crate::{camera::GlobeCameraState, globe_debug::TerrainDebug, terrain::TerrainElevation};
+use crate::{
+    camera::GlobeCameraState,
+    camera_sync::update_camera_and_origin,
+    globe_debug::{TerrainDebug, draw_cube_face_seams},
+    globe_render::{reconcile_cpu_terrain, sync_globe_tiles},
+    terrain::TerrainElevation,
+    terrain_backend::{TerrainBackend, TerrainRenderKey, choose_terrain_backend, use_cpu_terrain},
+};
 
 use self::pipeline::{DrawPipelines, SelectPipeline};
 use self::source::{SourceGpu, grid_indices, initialized};
 use self::view::GpuView;
 
-#[derive(Resource)]
-pub(crate) struct GpuTerrainEnabled(pub(crate) bool);
+pub(crate) struct TerrainRenderPlugin;
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Bevy run condition receives Res<T> by value"
-)]
-pub(crate) fn use_cpu_terrain(enabled: Res<GpuTerrainEnabled>) -> bool {
-    !enabled.0
-}
-
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Bevy startup system parameters"
-)]
-pub(crate) fn choose_terrain_backend(
-    mut enabled: ResMut<GpuTerrainEnabled>,
-    camera: Res<GlobeCameraState>,
-    terrain: Res<TerrainElevation>,
-    adapter: Res<RenderAdapter>,
-    device: Res<RenderDevice>,
-) {
-    if !enabled.0 {
-        return;
-    }
-    let limits = device.limits();
-    let grid = camera.planet.grid_segments();
-    let source_fits = terrain
-        .world()
-        .and_then(|world| world.surface_data())
-        .is_some_and(|source| {
-            let (width, height, _) = source.raster();
-            width.max(height) <= limits.max_texture_dimension_2d as usize
-        });
-    let flags = adapter.get_downlevel_capabilities().flags;
-    let dispatch = wgpu::DownlevelFlags::COMPUTE_SHADERS | wgpu::DownlevelFlags::INDIRECT_EXECUTION;
-    enabled.0 = source_fits
-        && flags.contains(dispatch)
-        && limits.max_storage_buffers_per_shader_stage >= 5
-        && limits.max_storage_buffer_binding_size >= 12 * 1024 * 1024
-        && grid.is_power_of_two()
-        && grid > 0
-        && grid.ilog2() + u32::from(camera.planet.max_lod()) <= 24;
-    if !enabled.0 {
-        warn!("Terrain GPU path unavailable for this terrain source or adapter; using CPU terrain");
-    }
-}
-
-pub(crate) struct GpuTerrainPlugin;
-
-impl Plugin for GpuTerrainPlugin {
+impl Plugin for TerrainRenderPlugin {
     fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            (
+                choose_terrain_backend,
+                reconcile_cpu_terrain.run_if(resource_changed::<TerrainBackend>),
+                sync_globe_tiles.run_if(use_cpu_terrain),
+            )
+                .chain()
+                .after(update_camera_and_origin)
+                .before(draw_cube_face_seams),
+        );
         app.sub_app_mut(RenderApp)
+            .init_resource::<PreparedTerrain>()
             .add_systems(ExtractSchedule, extract_terrain)
             .add_systems(
                 Render,
@@ -98,6 +69,11 @@ impl Plugin for GpuTerrainPlugin {
 }
 
 #[derive(Resource)]
+struct ExtractedTerrainFrame {
+    revision: u64,
+    gpu: Option<ExtractedTerrain>,
+}
+
 struct ExtractedTerrain {
     camera: GlobeCameraState,
     debug: bool,
@@ -110,18 +86,19 @@ struct ExtractedTerrain {
 )]
 fn extract_terrain(
     mut commands: Commands,
-    enabled: Extract<Res<GpuTerrainEnabled>>,
+    backend: Extract<Res<TerrainBackend>>,
     camera: Extract<Res<GlobeCameraState>>,
     debug: Extract<Res<TerrainDebug>>,
     terrain: Extract<Res<TerrainElevation>>,
 ) {
-    if enabled.0 {
-        commands.insert_resource(ExtractedTerrain {
+    commands.insert_resource(ExtractedTerrainFrame {
+        revision: terrain.revision(),
+        gpu: backend.uses_gpu().then(|| ExtractedTerrain {
             camera: (**camera).clone(),
             debug: debug.0,
             terrain: (**terrain).clone(),
-        });
-    }
+        }),
+    });
 }
 
 // Conservative bound from the WGSL enumeration window. Through LOD 5 each dimension is at most 32;
@@ -129,7 +106,15 @@ fn extract_terrain(
 const TILE_CAPACITY: u64 = 6 * 23 * 32 * 32;
 const DRAW_BYTES: u64 = 20;
 
-#[derive(Resource)]
+/// Cached raster data stays resident across geometry-only changes. Only an
+/// active GPU view owns draw resources. A different terrain revision retires both.
+#[derive(Default, Resource)]
+struct PreparedTerrain {
+    requested: Option<TerrainRenderKey>,
+    resident: Option<(u64, SourceGpu)>,
+    active: Option<TerrainGpu>,
+}
+
 struct TerrainGpu {
     source: SourceGpu,
     frame: Buffer,
@@ -140,16 +125,11 @@ struct TerrainGpu {
     reset: Buffer,
     selection: SelectPipeline,
     drawing: DrawPipelines,
-    key: (PlanetSpec, u64),
+    pipelines: HashMap<(TextureFormat, u32), [RenderPipeline; 2]>,
 }
 
 impl TerrainGpu {
-    fn new(
-        device: &RenderDevice,
-        planet: PlanetSpec,
-        revision: u64,
-        source: SourceGpu,
-    ) -> Option<Self> {
+    fn new(device: &RenderDevice, planet: PlanetSpec, source: SourceGpu) -> Option<Self> {
         let frame = allocate(
             device,
             "Terrain camera",
@@ -203,7 +183,7 @@ impl TerrainGpu {
             reset,
             selection,
             drawing,
-            key: (planet, revision),
+            pipelines: HashMap::new(),
         })
     }
     fn encode_selection(
@@ -240,26 +220,46 @@ fn allocate(device: &RenderDevice, label: &str, size: u64, usage: BufferUsages) 
     reason = "Bevy render resources are system parameters"
 )]
 fn prepare_terrain(
-    mut commands: Commands,
-    input: Option<Res<ExtractedTerrain>>,
-    gpu: Option<Res<TerrainGpu>>,
+    frame: Option<Res<ExtractedTerrainFrame>>,
+    mut prepared: ResMut<PreparedTerrain>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
 ) {
-    let Some(input) = input else { return };
-    let key = (input.camera.planet, input.terrain.revision());
-    if gpu.as_ref().is_some_and(|gpu| gpu.key == key) {
+    let Some(frame) = frame else { return };
+    let requested = frame.gpu.as_ref().map(|input| TerrainRenderKey {
+        planet: input.camera.planet,
+        revision: frame.revision,
+    });
+    if prepared
+        .resident
+        .as_ref()
+        .is_some_and(|(rev, _)| *rev != frame.revision)
+    {
+        prepared.resident = None;
+    }
+    if prepared.requested == requested {
         return;
     }
-    let source = gpu
-        .as_ref()
-        .filter(|gpu| gpu.key.1 == key.1)
-        .map(|gpu| gpu.source.clone())
-        .or_else(|| SourceGpu::upload(&device, &queue, &input.terrain.world()?.surface_data()?));
-    if let Some(gpu) = source.and_then(|source| TerrainGpu::new(&device, key.0, key.1, source)) {
-        commands.insert_resource(gpu);
-    } else {
-        error!("Could not upload GPU terrain source");
+
+    prepared.active = None;
+    prepared.requested = requested;
+    if let (Some(key), Some(input)) = (requested, &frame.gpu) {
+        if prepared.resident.is_none()
+            && let Some(data) = input.terrain.world().and_then(|world| world.surface_data())
+        {
+            prepared.resident =
+                SourceGpu::upload(&device, &queue, &data).map(|source| (key.revision, source));
+        }
+        prepared.active = prepared
+            .resident
+            .as_ref()
+            .and_then(|(_, source)| TerrainGpu::new(&device, key.planet, source.clone()));
+        if prepared.active.is_none() {
+            error!(
+                "Could not prepare GPU terrain for revision {}",
+                key.revision
+            );
+        }
     }
 }
 
@@ -268,8 +268,8 @@ fn prepare_terrain(
     reason = "Bevy render resources are system parameters"
 )]
 fn render_terrain(
-    input: Option<Res<ExtractedTerrain>>,
-    gpu: Option<Res<TerrainGpu>>,
+    frame: Option<Res<ExtractedTerrainFrame>>,
+    mut prepared: ResMut<PreparedTerrain>,
     queue: Res<RenderQueue>,
     view: ViewQuery<(
         &ExtractedCamera,
@@ -279,22 +279,24 @@ fn render_terrain(
         &Msaa,
     )>,
     mut context: RenderContext,
-    mut pipelines: Local<HashMap<(TextureFormat, u32), [RenderPipeline; 2]>>,
 ) {
-    let (Some(input), Some(gpu)) = (input, gpu) else {
+    let Some(input) = frame.as_ref().and_then(|frame| frame.gpu.as_ref()) else {
+        return;
+    };
+    let Some(gpu) = prepared.active.as_mut() else {
         return;
     };
     let (camera, view, target, depth, msaa) = view.into_inner();
     let (format, samples) = (target.main_texture_format(), msaa.samples());
-    let pipelines = pipelines.entry((format, samples)).or_insert_with(|| {
-        let device = context.render_device();
-        [false, true].map(|water| gpu.drawing.create(device, format, samples, water))
-    });
     let frame = input.view(camera, view, gpu.source.settings);
     queue.write_buffer(&gpu.frame, 0, bytes_of(&frame));
     let diagnostics = context.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     gpu.encode_selection(context.command_encoder(), frame.settings[0], diagnostics);
+    let pipelines = gpu.pipelines.entry((format, samples)).or_insert_with(|| {
+        let device = context.render_device();
+        [false, true].map(|water| gpu.drawing.create(device, format, samples, water))
+    });
     let color = [Some(target.get_color_attachment())];
     let mut pass = context.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("Terrain indirect drawing"),

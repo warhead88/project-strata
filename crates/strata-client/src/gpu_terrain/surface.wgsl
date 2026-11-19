@@ -123,7 +123,7 @@ fn sample_surface(face: u32, uv: vec2<f32>, dir: vec3<f32>) -> Surface {
         let ab = river[1].xyz;
         let t = clamp(dot(dir - a, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
         let raw = a + ab * t;
-        let d = 2.0 * asin(min(1.0, length(dir - normalize(raw)) * 0.5)) * view.planet.x;
+        let d = 2.0 * asin(min(1.0, length(dir - normalize(raw)) * 0.5)) * bitcast<f32>(view.detail.y);
         let p = mix(river[2], river[3], t);
         let ratio = d / max(p.y, 1.0);
         if d >= p.w || ratio >= best { continue; }
