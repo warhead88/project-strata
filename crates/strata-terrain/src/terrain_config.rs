@@ -27,17 +27,6 @@ impl TerrainConfig {
         }
     }
 
-    /// Creates a seed-driven procedural planet configuration with [`PlanetSpec::earth`]
-    /// and [`DEFAULT_MACRO_RESOLUTION`].
-    #[must_use]
-    pub fn procedural(seed: u64) -> Self {
-        Self {
-            source: TerrainSource::Procedural { seed },
-            planet: PlanetSpec::earth(),
-            macro_resolution: DEFAULT_MACRO_RESOLUTION,
-        }
-    }
-
     /// Creates a configuration backed by an imported equirectangular [`DemGrid`].
     #[must_use]
     pub fn from_dem(grid: DemGrid, seed: u64) -> Self {
@@ -84,9 +73,7 @@ impl TerrainConfig {
     #[must_use]
     pub const fn seed(&self) -> u64 {
         match &self.source {
-            TerrainSource::Earth { seed }
-            | TerrainSource::Procedural { seed }
-            | TerrainSource::Dem { seed, .. } => *seed,
+            TerrainSource::Earth { seed } | TerrainSource::Dem { seed, .. } => *seed,
         }
     }
 }

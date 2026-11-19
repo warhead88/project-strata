@@ -1,11 +1,11 @@
 use std::f64::consts::TAU;
 use std::ops::{BitOr, BitOrAssign};
 
-use strata_globe::{EcefMeters, ElevationSampler};
+use strata_globe::EcefMeters;
 
 use crate::climate::{Biome, ClimateSample};
 use crate::hydrology::{BathymetryZone, WaterSample};
-use crate::strata::{GeologyProvince, SurfaceMaterial};
+use crate::strata::{GeologyProvince, StrataColumn, SurfaceMaterial};
 use crate::terrain_world::TerrainWorld;
 
 /// Bitflags describing notable physical-geographic and engineering site tags.
@@ -124,6 +124,19 @@ pub struct RenderVertexSample {
     pub water: WaterSample,
 }
 
+/// Single-pass base vertex bundle for client tile mesh generation (`Step 2`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TileVertexBase {
+    /// Final surface elevation in meters (including hydrology and patches).
+    pub elevation_m: f64,
+    /// Hydrological state at this vertex.
+    pub water: WaterSample,
+    /// Climate and cryosphere indicators at this vertex.
+    pub climate: ClimateSample,
+    /// Physical-geographic biome at this vertex.
+    pub biome: Biome,
+}
+
 /// Aggregate engineering, hydrological, and geographic assessment over a circular site.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SiteAssessment {
@@ -203,10 +216,12 @@ pub(crate) fn compute_slope_and_aspect(world: &TerrainWorld, unit: EcefMeters) -
     let n_pos = offset_unit(unit, north, eps);
     let n_neg = offset_unit(unit, north, -eps);
 
-    let slope_east =
-        (world.sample_elevation(e_pos) - world.sample_elevation(e_neg)) / (2.0 * delta_m);
-    let slope_north =
-        (world.sample_elevation(n_pos) - world.sample_elevation(n_neg)) / (2.0 * delta_m);
+    let slope_east = (world.sample_elevation_unit_prevalidated(e_pos)
+        - world.sample_elevation_unit_prevalidated(e_neg))
+        / (2.0 * delta_m);
+    let slope_north = (world.sample_elevation_unit_prevalidated(n_pos)
+        - world.sample_elevation_unit_prevalidated(n_neg))
+        / (2.0 * delta_m);
     let grad = (slope_east * slope_east + slope_north * slope_north).sqrt();
     let slope_rad = grad.atan();
     let slope_percent = grad * 100.0;
@@ -277,4 +292,78 @@ pub(crate) fn argmax(counts: &[u16]) -> usize {
         }
     }
     best_i
+}
+
+pub(crate) fn build_strata_column_for_unit(
+    world: &TerrainWorld,
+    unit: EcefMeters,
+    elev: f64,
+    water: WaterSample,
+    cell: crate::macro_cache::MacroCell,
+    seed: u64,
+) -> StrataColumn {
+    let climate = crate::climate::compute_climate_sample(cell, elev, water);
+    let biome = crate::climate::classify_biome(elev, water, climate);
+    let province = GeologyProvince::from_id(cell.geology_province);
+    let (slope_rad, _, _) = compute_slope_and_aspect(world, unit);
+    crate::strata_derive::derive_strata_column(
+        unit,
+        elev,
+        slope_rad.sin(),
+        water,
+        climate,
+        biome,
+        province,
+        seed,
+    )
+}
+
+pub(crate) fn build_terrain_sample_for_unit(
+    world: &TerrainWorld,
+    unit: EcefMeters,
+    elev: f64,
+    water: WaterSample,
+    cell: crate::macro_cache::MacroCell,
+    has_underground_void: bool,
+) -> TerrainSample {
+    let climate = crate::climate::compute_climate_sample(cell, elev, water);
+    let biome = crate::climate::classify_biome(elev, water, climate);
+    let province = GeologyProvince::from_id(cell.geology_province);
+    let (slope_rad, slope_percent, aspect_rad) = compute_slope_and_aspect(world, unit);
+    let surface_material =
+        crate::strata_derive::derive_surface_material(elev, slope_rad.sin(), water, climate, biome);
+    let permafrost = water.kind == crate::hydrology::WaterBodyKind::Dry
+        && (climate.mean_temp_c < -1.0 || climate.permafrost_prob > 0.15);
+
+    TerrainSample {
+        elevation_m: elev,
+        slope_rad,
+        slope_percent,
+        aspect_rad,
+        roughness: cell.roughness,
+        water,
+        bathymetry: crate::hydrology::bathymetry_zone(elev),
+        climate,
+        biome,
+        province,
+        surface_material,
+        permafrost,
+        has_underground_void,
+    }
+}
+
+pub(crate) fn build_render_vertex_for_sample(
+    elev: f64,
+    slope_sin: f64,
+    water: WaterSample,
+    cell: crate::macro_cache::MacroCell,
+) -> RenderVertexSample {
+    let climate = crate::climate::compute_climate_sample(cell, elev, water);
+    let biome = crate::climate::classify_biome(elev, water, climate);
+    let albedo_rgb = crate::climate::surface_albedo_rgb(elev, slope_sin, water, climate, biome);
+    RenderVertexSample {
+        elevation_m: elev,
+        albedo_rgb,
+        water,
+    }
 }

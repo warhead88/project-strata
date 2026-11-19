@@ -93,28 +93,47 @@ fn earth_geography_and_climate_sanity() {
     );
     assert_eq!(world.bathymetry_zone(pac_elev), BathymetryZone::Abyssal);
     assert_eq!(world.sample_biome(pacific), Biome::OpenWater);
+}
 
-    // Recognizable continents, islands, and seas.
-    for (name, lat, lon) in [
-        ("Western Europe", 49.0, 10.0),
-        ("UK", 54.0, -2.0),
-        ("Japan", 36.5, 138.0),
-        ("Australia", -25.0, 134.0),
-        ("Greenland", 72.5, -42.0),
-        ("North America", 42.0, -98.0),
-        ("India", 21.0, 78.5),
-    ] {
-        let elev = world.sample_elevation(lat_lon_to_unit(lat, lon));
-        assert!(elev > 0.0, "{name} should be emergent land, got {elev} m");
-    }
+#[test]
+fn earth_real_dem_landmarks_sanity() {
+    let world = TerrainWorld::earth_default();
 
-    for (name, lat, lon) in [
-        ("Mediterranean", 35.8, 16.0),
-        ("Black Sea", 43.3, 34.0),
-        ("Red Sea", 20.5, 38.5),
+    // Recognizable continents, mountain belts, islands, seas, and ocean trenches (Real Earth DEM).
+    for (name, lat, lon, min_m, max_m) in [
+        ("Himalayas/Everest", 28.0, 86.9, 4_000.0, 9_000.0),
+        ("Alps", 46.5, 8.0, 1_200.0, 5_000.0),
+        ("Andes", -15.0, -70.0, 3_000.0, 7_500.0),
+        ("Moscow", 55.75, 37.6, 50.0, 500.0),
+        ("Sahara", 23.0, 10.0, 100.0, 3_500.0),
+        ("Amazon", -3.0, -60.0, 0.0, 500.0),
+        ("UK", 52.5, -1.5, 0.0, 1_500.0),
+        ("Italy", 42.5, 12.5, 0.0, 3_000.0),
+        ("Japan", 36.0, 138.0, 0.0, 4_000.0),
+        ("Australia", -25.0, 134.0, 0.0, 2_000.0),
+        ("Antarctica", -89.0, 0.0, 1_500.0, 5_000.0),
+        ("Greenland", 72.5, -42.0, 1_500.0, 4_000.0),
+        ("North America", 42.0, -98.0, 100.0, 2_000.0),
+        ("India", 21.0, 78.5, 50.0, 2_000.0),
+        ("Mariana Trench", 11.3, 142.2, -11_500.0, -6_000.0),
+        ("Mediterranean", 35.5, 18.0, -6_000.0, -1_000.0),
+        ("Black Sea", 43.3, 34.0, -3_000.0, -500.0),
+        ("Red Sea", 20.5, 38.5, -3_500.0, -300.0),
+        ("Pacific", 0.0, -140.0, -6_500.0, -3_000.0),
+        ("Atlantic", 25.0, -45.0, -6_500.0, -2_000.0),
     ] {
-        let elev = world.sample_elevation(lat_lon_to_unit(lat, lon));
-        assert!(elev < 0.0, "{name} should be marine basin, got {elev} m");
+        let unit = lat_lon_to_unit(lat, lon);
+        let lat_rt = unit.y.clamp(-1.0, 1.0).asin().to_degrees();
+        let lon_rt = unit.x.atan2(unit.z).to_degrees();
+        assert!((lat_rt - lat).abs() < 1e-9, "{name} lat roundtrip failed");
+        if lat.abs() < 89.9 {
+            assert!((lon_rt - lon).abs() < 1e-9, "{name} lon roundtrip failed");
+        }
+        let elev = world.sample_elevation(unit);
+        assert!(
+            elev > min_m && elev < max_m,
+            "{name} ({lat}, {lon}) expected in ({min_m}, {max_m}), got {elev} m"
+        );
     }
 }
 

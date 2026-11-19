@@ -159,13 +159,10 @@ pub fn face_uv_to_unit(face: CubeFace, uv: FaceUv) -> EcefMeters {
     cube_pt.scale(1.0 / len)
 }
 
-/// Maps a unit/non-zero ECEF direction to `(CubeFace, FaceUv)`.
-///
-/// # Errors
-///
-/// Returns [`GlobeError`] if `vec` is non-finite or zero-magnitude.
-pub fn ecef_to_face_uv(vec: EcefMeters) -> Result<(CubeFace, FaceUv), GlobeError> {
-    let unit = vec.normalized()?;
+/// Maps a pre-normalized unit ECEF direction to `(CubeFace, FaceUv)`.
+#[inline]
+#[must_use]
+pub fn ecef_to_face_uv_unit(unit: EcefMeters) -> (CubeFace, FaceUv) {
     let face = CubeFace::from_dominant_axis(unit);
     let basis = face.basis();
     let dn = unit.dot(basis.normal);
@@ -173,7 +170,18 @@ pub fn ecef_to_face_uv(vec: EcefMeters) -> Result<(CubeFace, FaceUv), GlobeError
     let yf = unit.dot(basis.up) / dn;
     let s = (xf.atan() * (4.0 / PI)).clamp(-1.0, 1.0);
     let t = (yf.atan() * (4.0 / PI)).clamp(-1.0, 1.0);
-    Ok((face, FaceUv::clamped(0.5 * (s + 1.0), 0.5 * (t + 1.0))))
+    (face, FaceUv::clamped(0.5 * (s + 1.0), 0.5 * (t + 1.0)))
+}
+
+/// Maps a unit/non-zero ECEF direction to `(CubeFace, FaceUv)`.
+///
+/// # Errors
+///
+/// Returns [`GlobeError`] if `vec` is non-finite or zero-magnitude.
+#[inline]
+pub fn ecef_to_face_uv(vec: EcefMeters) -> Result<(CubeFace, FaceUv), GlobeError> {
+    let unit = vec.normalized()?;
+    Ok(ecef_to_face_uv_unit(unit))
 }
 
 /// Equal-angle tangent warp preserving exact `{-1.0, 0.0, +1.0}` endpoints

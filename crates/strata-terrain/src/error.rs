@@ -26,6 +26,11 @@ pub enum TerrainError {
         /// Index of the non-finite texel.
         index: usize,
     },
+    /// Embedded or supplied SDEM raster could not be decoded.
+    InvalidEarthDem {
+        /// Decode failure reason.
+        reason: &'static str,
+    },
     /// A coordinate or parameter contained NaN or infinity.
     NonFiniteCoordinate,
     /// A direction vector had zero length where a unit direction is required.
@@ -78,6 +83,9 @@ impl fmt::Display for TerrainError {
             }
             Self::NonFiniteDemValue { index } => {
                 write!(f, "non-finite DEM elevation value at index {index}")
+            }
+            Self::InvalidEarthDem { reason } => {
+                write!(f, "invalid embedded Earth DEM: {reason}")
             }
             Self::NonFiniteCoordinate => {
                 write!(f, "non-finite coordinate or terrain parameter")

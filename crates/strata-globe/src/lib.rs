@@ -15,7 +15,9 @@ pub mod snapshot;
 pub mod tile;
 
 pub use coords::{EcefMeters, LocalOrigin, RebasePolicy, RenderVec3, SurfaceCoord};
-pub use cube::{CubeFace, FaceBasis, FaceUv, ecef_to_face_uv, face_uv_to_unit};
+pub use cube::{
+    CubeFace, FaceBasis, FaceUv, ecef_to_face_uv, ecef_to_face_uv_unit, face_uv_to_unit,
+};
 pub use elevation::{ElevationRange, ElevationSampler, FlatElevation};
 pub use error::GlobeError;
 pub use lod::{
@@ -25,7 +27,7 @@ pub use lod::{
 pub use mesh::{
     TileMeshF64, TileRenderMesh, build_stitched_indices, build_tile_mesh_f64,
     build_tile_mesh_f64_with_elevation, build_tile_render_mesh,
-    build_tile_render_mesh_with_elevation,
+    build_tile_render_mesh_with_elevation, canonical_tangent_basis,
 };
 pub use planet::{
     DEFAULT_GRID_SEGMENTS, DEFAULT_MAX_LOD, EARTH_MEAN_RADIUS_METERS, MAX_SUPPORTED_LOD, PlanetSpec,

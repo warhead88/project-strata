@@ -219,7 +219,8 @@ fn terrain_normal_canonical(
 
 /// Deterministic right-handed tangent basis `(t1, t2)` with `t1 x t2 == n`,
 /// independent of cube-face orientation so shared seam/corner vertices match.
-fn canonical_tangent_basis(n: EcefMeters) -> (EcefMeters, EcefMeters) {
+#[must_use]
+pub fn canonical_tangent_basis(n: EcefMeters) -> (EcefMeters, EcefMeters) {
     let ax = n.x.abs();
     let ay = n.y.abs();
     let az = n.z.abs();

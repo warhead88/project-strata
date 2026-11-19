@@ -4,12 +4,12 @@ use strata_globe::{
 
 use crate::earth_geography::{TerrainSource, lat_lon_to_unit};
 use crate::error::TerrainError;
-use crate::hydrology::{LakeDef, LakeId, Navigability, RiverDef, RiverId, RiverWaypoint, Salinity};
+use crate::hydrology::{LakeDef, LakeId, RiverDef, RiverId, RiverWaypoint};
 use crate::hydrology_data::{EARTH_LAKES, EARTH_RIVERS};
 use crate::hydrology_index::{
     BUCKET_DIM, BucketRange, HydrologyIndex, RiverSegRef, TOTAL_BUCKETS, arc_distance_rad,
 };
-use crate::macro_climate::{angular_distance, evaluate_procedural_macro};
+use crate::macro_climate::angular_distance;
 
 pub(crate) fn build_hydrology_index(
     planet: PlanetSpec,
@@ -19,7 +19,6 @@ pub(crate) fn build_hydrology_index(
     let scale = (radius_m / EARTH_MEAN_RADIUS_METERS).clamp(0.02, 4.0);
     let (lakes, rivers) = match source {
         TerrainSource::Earth { .. } => build_earth_hydrology(scale)?,
-        TerrainSource::Procedural { seed } => build_procedural_hydrology(radius_m, *seed)?,
         TerrainSource::Dem { .. } => (Vec::new(), Vec::new()),
     };
 
@@ -119,126 +118,6 @@ fn build_earth_hydrology(scale: f64) -> Result<(Vec<LakeDef>, Vec<RiverDef>), Te
         )?);
     }
     Ok((lakes, rivers))
-}
-
-fn build_procedural_hydrology(
-    planet_radius_m: f64,
-    seed: u64,
-) -> Result<(Vec<LakeDef>, Vec<RiverDef>), TerrainError> {
-    let scale = (planet_radius_m / EARTH_MEAN_RADIUS_METERS).clamp(0.03, 2.0);
-    let mut lakes = Vec::new();
-    let mut rivers = Vec::new();
-
-    let candidates = 64_u32;
-    let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
-    for i in 0..candidates {
-        let y = 1.0 - (f64::from(i) + 0.5) * (2.0 / f64::from(candidates));
-        let r = (1.0 - y * y).max(0.0).sqrt();
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "seed & 0xFFFF is at most 65535, exact in f64"
-        )]
-        let seed_offset = ((seed & 0xFFFF) as f64) * 0.01;
-        let theta = golden_angle * f64::from(i) + seed_offset;
-        let dir = EcefMeters::from_raw(r * theta.cos(), y, r * theta.sin());
-        let macro_s = evaluate_procedural_macro(dir, seed);
-        let elev = f64::from(macro_s.macro_elevation_m);
-
-        if lakes.len() < 6 && elev > 120.0 && elev < 1400.0 && i % 7 == 2 {
-            let id = LakeId(u32::try_from(lakes.len()).unwrap_or(u32::MAX));
-            lakes.push(LakeDef {
-                id,
-                name: "Procedural Lake",
-                center_unit: dir,
-                radius_rad: 0.016,
-                surface_elevation_m: elev,
-                max_depth_m: 120.0 + f64::from(i % 5) * 45.0,
-                salinity: if i % 14 == 2 {
-                    Salinity::Saline
-                } else {
-                    Salinity::Freshwater
-                },
-            });
-        }
-
-        if rivers.len() < 10
-            && elev > 420.0
-            && let Some(wps) = trace_procedural_river(dir, elev, scale, seed)
-        {
-            let id = RiverId(u32::try_from(rivers.len()).unwrap_or(u32::MAX));
-            rivers.push(RiverDef::new(
-                id,
-                "Procedural River",
-                Navigability::RiverVessel,
-                wps,
-            )?);
-        }
-    }
-
-    Ok((lakes, rivers))
-}
-
-fn trace_procedural_river(
-    start: EcefMeters,
-    start_elev: f64,
-    scale: f64,
-    seed: u64,
-) -> Option<Vec<RiverWaypoint>> {
-    let step_rad = 0.045_f64;
-    let mut cur = start;
-    let mut cur_elev = start_elev;
-    let mut wps = vec![RiverWaypoint {
-        unit_dir: cur,
-        surface_elevation_m: cur_elev,
-        half_width_m: 400.0 * scale,
-        channel_depth_m: 5.0,
-        valley_half_width_m: 14_000.0 * scale,
-        discharge_m3s: 600.0,
-    }];
-
-    for step in 1..=10 {
-        let up = if cur.y.abs() > 0.98 {
-            EcefMeters::from_raw(0.0, 0.0, 1.0)
-        } else {
-            EcefMeters::from_raw(0.0, 1.0, 0.0)
-        };
-        let t1_raw = up.cross(cur);
-        let t1 = t1_raw.scale(1.0 / t1_raw.norm());
-        let t2 = cur.cross(t1);
-
-        let mut best_dir = cur;
-        let mut best_elev = f64::INFINITY;
-        for k in 0..8 {
-            let ang = std::f64::consts::TAU * (f64::from(k) / 8.0);
-            let cand_raw = cur + (t1.scale(ang.cos()) + t2.scale(ang.sin())).scale(step_rad);
-            let cand = cand_raw.scale(1.0 / cand_raw.norm());
-            let e = f64::from(evaluate_procedural_macro(cand, seed).macro_elevation_m);
-            if e < best_elev {
-                best_elev = e;
-                best_dir = cand;
-            }
-        }
-        cur = best_dir;
-        cur_elev = best_elev.min(cur_elev).max(0.0);
-        let progress = f64::from(step) / 10.0;
-        wps.push(RiverWaypoint {
-            unit_dir: cur,
-            surface_elevation_m: cur_elev,
-            half_width_m: (400.0 + progress * 3_400.0) * scale,
-            channel_depth_m: 5.0 + progress * 16.0,
-            valley_half_width_m: (14_000.0 + progress * 32_000.0) * scale,
-            discharge_m3s: 600.0 + progress * 18_000.0,
-        });
-        if best_elev <= 0.0 {
-            break;
-        }
-    }
-
-    if wps.len() >= 3 && start_elev - cur_elev > 150.0 {
-        Some(wps)
-    } else {
-        None
-    }
 }
 
 #[expect(

@@ -1,16 +1,23 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use strata_globe::{
-    CoarserEdges, EcefMeters, ElevationSampler, LocalOrigin, PlanetSpec, TileId, TileUv,
-    build_tile_mesh_f64_with_elevation, face_uv_to_unit,
+    EcefMeters, ElevationSampler, LocalOrigin, PlanetSpec, TileId, TileUv, canonical_tangent_basis,
+    face_uv_to_unit,
 };
-use strata_terrain::{TerrainWorld, WaterBodyKind, WaterSample};
+use strata_terrain::{TerrainWorld, TileVertexBase};
 
 use crate::terrain::sample_clamped_elevation;
+use crate::tile_mesh_colors::{build_water_stage, compute_terrain_colors};
 
 /// Single colored tile mesh (`terrain` or `water`) in tile-local `f32` coordinates
 /// relative to [`BuiltTileMeshes::tile_origin`].
+///
+/// Triangle indices are decoupled from vertices and supplied at GPU upload time
+/// from [`crate::tile_cache::StitchedIndexTable`] so edge-stitching changes never
+/// trigger vertex rebuilds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TileColoredMesh {
     /// Vertex positions relative to `tile_origin` in `f32` meters.
@@ -21,8 +28,6 @@ pub struct TileColoredMesh {
     pub uvs: Vec<[f32; 2]>,
     /// Vertex colors in linear RGBA (`[r, g, b, a]`).
     pub colors: Vec<[f32; 4]>,
-    /// Watertight stitched triangle indices (`CCW` outward winding).
-    pub indices: Vec<u32>,
 }
 
 /// Complete CPU-built tile geometry bundle ready for GPU upload.
@@ -30,21 +35,19 @@ pub struct TileColoredMesh {
 pub struct BuiltTileMeshes {
     /// Quadtree tile identifier.
     pub tile: TileId,
-    /// Edge-stitching configuration used for `indices`.
-    pub coarser_edges: CoarserEdges,
     /// Tile-local floating origin at the tile center in `f64` ECEF meters.
     pub tile_origin: LocalOrigin,
     /// Terrain revision this mesh was built against.
     pub revision: u64,
     /// Displaced terrain mesh with physical-geographic or bathymetric bed vertex colors.
     pub terrain_mesh: TileColoredMesh,
-    /// Optional stitched water surface mesh when oceans, lakes, or rivers exist on this tile.
+    /// Optional water surface mesh when oceans, lakes, or rivers exist on this tile.
     pub water_mesh: Option<TileColoredMesh>,
 }
 
-/// Converts a [`TileColoredMesh`] into a Bevy [`Mesh`] with `ATTRIBUTE_COLOR`.
+/// Converts a [`TileColoredMesh`] into a Bevy [`Mesh`] with `ATTRIBUTE_COLOR` and stitched indices.
 #[must_use]
-pub fn to_bevy_mesh(tile_mesh: TileColoredMesh) -> Mesh {
+pub fn to_bevy_mesh(tile_mesh: TileColoredMesh, indices: &[u32]) -> Mesh {
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
@@ -53,76 +56,37 @@ pub fn to_bevy_mesh(tile_mesh: TileColoredMesh) -> Mesh {
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, tile_mesh.normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, tile_mesh.uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, tile_mesh.colors);
-    mesh.insert_indices(Indices::U32(tile_mesh.indices));
+    mesh.insert_indices(Indices::U32(indices.to_vec()));
     mesh
 }
 
-/// Builds displaced terrain and optional stitched water meshes in tile-local coordinates
-/// anchored at `tile_origin` so camera `LocalOrigin` rebases require zero mesh rebuilds.
+/// Builds displaced terrain and optional water meshes in tile-local coordinates
+/// using a single pass over the vertex grid.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "non-cancellable builder convenience wrapper exercised by unit tests"
+    )
+)]
 #[must_use]
 pub fn build_tile_meshes(
     planet: PlanetSpec,
     tile: TileId,
-    coarser_edges: CoarserEdges,
     revision: u64,
     sampler: &dyn ElevationSampler,
     world: Option<&TerrainWorld>,
 ) -> BuiltTileMeshes {
-    let r_base = planet.radius_meters();
-    let min_r = 1.0_f64.min(r_base * 0.5);
-    let center_unit = face_uv_to_unit(
-        tile.face,
-        tile.tile_uv_to_face_uv(TileUv::clamped(0.5, 0.5)),
-    );
-    let center_elev = sample_clamped_elevation(planet, center_unit, sampler);
-    let tile_center_ecef = center_unit.scale((r_base + center_elev).max(min_r));
-    let tile_origin = LocalOrigin::new(tile_center_ecef).unwrap_or(LocalOrigin {
-        ecef: EcefMeters::ZERO,
-    });
-
-    let f64_mesh = build_tile_mesh_f64_with_elevation(planet, tile, coarser_edges, sampler);
-    let n = f64_mesh.grid_segments;
-    let vertex_count = f64_mesh.positions_ecef.len();
-
-    let terrain_positions: Vec<[f32; 3]> = f64_mesh
-        .positions_ecef
-        .iter()
-        .map(|&p| tile_origin.to_render_vec3(p).to_array())
-        .collect();
-
-    let Some(world) = world else {
-        let neutral = Color::srgb(0.62, 0.65, 0.68).to_linear().to_f32_array();
-        let terrain_mesh = TileColoredMesh {
-            positions: terrain_positions,
-            normals: f64_mesh.normals,
-            uvs: f64_mesh.uvs,
-            colors: vec![neutral; vertex_count],
-            indices: f64_mesh.indices,
-        };
-        return BuiltTileMeshes {
-            tile,
-            coarser_edges,
-            tile_origin,
-            revision,
-            terrain_mesh,
-            water_mesh: None,
-        };
-    };
-
-    let (terrain_colors, has_water, shore_hint_rgb) =
-        sample_terrain_colors(tile, n, &f64_mesh.normals, world);
-
-    // Zero-allocation fast reject for dry tiles (including high-elevation dry land).
-    let water_mesh = if has_water {
-        Some(build_water_mesh(
+    let terrain_stage = build_terrain_stage(planet, tile, sampler, world);
+    let water_mesh = if terrain_stage.has_water {
+        Some(build_water_stage(
             planet,
             tile,
-            tile_origin,
-            &f64_mesh.positions_ecef,
-            f64_mesh.uvs.clone(),
-            f64_mesh.indices.clone(),
-            world,
-            shore_hint_rgb,
+            terrain_stage.tile_origin,
+            &terrain_stage.unit_dirs,
+            &terrain_stage.base_samples,
+            terrain_stage.uvs.clone(),
+            terrain_stage.shore_hint_rgb,
         ))
     } else {
         None
@@ -130,219 +94,283 @@ pub fn build_tile_meshes(
 
     BuiltTileMeshes {
         tile,
-        coarser_edges,
-        tile_origin,
+        tile_origin: terrain_stage.tile_origin,
         revision,
         terrain_mesh: TileColoredMesh {
-            positions: terrain_positions,
-            normals: f64_mesh.normals,
-            uvs: f64_mesh.uvs,
-            colors: terrain_colors,
-            indices: f64_mesh.indices,
+            positions: terrain_stage.positions,
+            normals: terrain_stage.normals,
+            uvs: terrain_stage.uvs,
+            colors: terrain_stage.colors,
         },
         water_mesh,
     }
 }
 
-fn sample_terrain_colors(
+/// Cancellable single-pass tile builder for background streaming workers.
+///
+/// Checks `cancelled` before building terrain vertices and again before building
+/// the water mesh so stale tasks abort immediately without wasted work.
+#[must_use]
+pub fn build_tile_meshes_cancellable(
+    planet: PlanetSpec,
     tile: TileId,
-    n: u32,
-    normals: &[[f32; 3]],
-    world: &TerrainWorld,
-) -> (Vec<[f32; 4]>, bool, [f32; 3]) {
-    let inv_n = 1.0 / f64::from(n);
-    let mut colors = Vec::with_capacity(normals.len());
-    let mut has_water = false;
-    let mut shore_hint_rgb = [0.08_f32, 0.36, 0.48];
-    let mut idx = 0_usize;
+    revision: u64,
+    sampler: &dyn ElevationSampler,
+    world: Option<&TerrainWorld>,
+    cancelled: &AtomicBool,
+) -> Option<BuiltTileMeshes> {
+    if cancelled.load(Ordering::Relaxed) {
+        return None;
+    }
+    let terrain_stage = build_terrain_stage(planet, tile, sampler, world);
+    let water_mesh = if terrain_stage.has_water {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(build_water_stage(
+            planet,
+            tile,
+            terrain_stage.tile_origin,
+            &terrain_stage.unit_dirs,
+            &terrain_stage.base_samples,
+            terrain_stage.uvs.clone(),
+            terrain_stage.shore_hint_rgb,
+        ))
+    } else {
+        None
+    };
 
+    Some(BuiltTileMeshes {
+        tile,
+        tile_origin: terrain_stage.tile_origin,
+        revision,
+        terrain_mesh: TileColoredMesh {
+            positions: terrain_stage.positions,
+            normals: terrain_stage.normals,
+            uvs: terrain_stage.uvs,
+            colors: terrain_stage.colors,
+        },
+        water_mesh,
+    })
+}
+
+struct TerrainStageOutput {
+    tile_origin: LocalOrigin,
+    unit_dirs: Vec<EcefMeters>,
+    base_samples: Vec<TileVertexBase>,
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
+    colors: Vec<[f32; 4]>,
+    has_water: bool,
+    shore_hint_rgb: [f32; 3],
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "UVs and outward surface normals intentionally narrow to f32 vertex attributes"
+)]
+fn build_terrain_stage(
+    planet: PlanetSpec,
+    tile: TileId,
+    sampler: &dyn ElevationSampler,
+    world: Option<&TerrainWorld>,
+) -> TerrainStageOutput {
+    let n = planet.grid_segments();
+    let stride = (n + 1) as usize;
+    let vertex_count = stride * stride;
+    let inv_n = 1.0 / f64::from(n);
+    let r_base = planet.radius_meters();
+    let min_r = 1.0_f64.min(r_base * 0.5);
+
+    let mut unit_dirs = Vec::with_capacity(vertex_count);
+    let mut positions_ecef = Vec::with_capacity(vertex_count);
+    let mut uvs = Vec::with_capacity(vertex_count);
+    let mut base_samples = if world.is_some() {
+        Vec::with_capacity(vertex_count)
+    } else {
+        Vec::new()
+    };
+
+    // Single-pass vertex sampling: each grid vertex queries TerrainWorld exactly once.
     for iy in 0..=n {
         let v = f64::from(iy) * inv_n;
         for ix in 0..=n {
             let u = f64::from(ix) * inv_n;
             let unit_dir =
                 face_uv_to_unit(tile.face, tile.tile_uv_to_face_uv(TileUv::clamped(u, v)));
-            let normal = normals[idx];
-            let dot = (f64::from(normal[0]) * unit_dir.x
-                + f64::from(normal[1]) * unit_dir.y
-                + f64::from(normal[2]) * unit_dir.z)
-                .clamp(0.0, 1.0);
-            let slope_sin = (1.0 - dot * dot).max(0.0).sqrt();
-
-            let sample = world.sample_render_vertex(unit_dir, slope_sin);
-            let srgb = match sample.water.kind {
-                WaterBodyKind::Dry => sample.albedo_rgb,
-                WaterBodyKind::Ocean => {
-                    has_water = true;
-                    shore_hint_rgb = [0.09, 0.42, 0.52];
-                    seabed_srgb(sample.water.depth_m, slope_sin)
-                }
-                WaterBodyKind::River(_) => {
-                    has_water = true;
-                    shore_hint_rgb = [0.06, 0.29, 0.42];
-                    riverbed_srgb(sample.water.depth_m)
-                }
-                WaterBodyKind::Lake(_) => {
-                    has_water = true;
-                    shore_hint_rgb = if sample.water.is_freshwater {
-                        [0.04, 0.24, 0.43]
-                    } else {
-                        [0.06, 0.31, 0.38]
-                    };
-                    lakebed_srgb(sample.water.depth_m)
-                }
+            let elev = if let Some(w) = world {
+                let base = w.sample_tile_vertex_base(unit_dir);
+                let clamped = if base.elevation_m.is_finite() {
+                    base.elevation_m.max(min_r - r_base)
+                } else {
+                    0.0
+                };
+                base_samples.push(base);
+                clamped
+            } else {
+                sample_clamped_elevation(planet, unit_dir, sampler)
             };
-            colors.push(srgb_to_linear_rgba(srgb));
-            idx += 1;
+            positions_ecef.push(unit_dir.scale((r_base + elev).max(min_r)));
+            unit_dirs.push(unit_dir);
+            uvs.push([u as f32, v as f32]);
         }
     }
 
-    (colors, has_water, shore_hint_rgb)
+    let tile_center_ecef = if n.is_multiple_of(2) {
+        let half = (n / 2) as usize;
+        positions_ecef[half * stride + half]
+    } else {
+        let center_unit = face_uv_to_unit(
+            tile.face,
+            tile.tile_uv_to_face_uv(TileUv::clamped(0.5, 0.5)),
+        );
+        let center_elev = sample_clamped_elevation(planet, center_unit, sampler);
+        center_unit.scale((r_base + center_elev).max(min_r))
+    };
+    let tile_origin = LocalOrigin::new(tile_center_ecef).unwrap_or(LocalOrigin {
+        ecef: EcefMeters::ZERO,
+    });
+
+    let positions: Vec<[f32; 3]> = positions_ecef
+        .iter()
+        .map(|&p| tile_origin.to_render_vec3(p).to_array())
+        .collect();
+
+    let normals = compute_tile_normals(
+        planet,
+        tile,
+        n,
+        stride,
+        r_base,
+        min_r,
+        &unit_dirs,
+        &positions_ecef,
+        sampler,
+        world,
+    );
+
+    let (colors, has_water, shore_hint_rgb) = if world.is_some() {
+        compute_terrain_colors(&unit_dirs, &normals, &base_samples)
+    } else {
+        let neutral = Color::srgb(0.62, 0.65, 0.68).to_linear().to_f32_array();
+        (vec![neutral; vertex_count], false, [0.08_f32, 0.36, 0.48])
+    };
+
+    TerrainStageOutput {
+        tile_origin,
+        unit_dirs,
+        base_samples,
+        positions,
+        normals,
+        uvs,
+        colors,
+        has_water,
+        shore_hint_rgb,
+    }
 }
 
 #[expect(
     clippy::too_many_arguments,
     clippy::cast_possible_truncation,
-    reason = "water mesh builder bundles tile geometry, world sampler, and shore color hint"
+    reason = "hybrid interior/perimeter normal kernel converts unit ECEF normals to f32"
 )]
-fn build_water_mesh(
+fn compute_tile_normals(
     planet: PlanetSpec,
     tile: TileId,
-    tile_origin: LocalOrigin,
-    terrain_positions_ecef: &[EcefMeters],
-    uvs: Vec<[f32; 2]>,
-    indices: Vec<u32>,
-    world: &TerrainWorld,
-    shore_hint_rgb: [f32; 3],
-) -> TileColoredMesh {
-    let n = planet.grid_segments();
-    let inv_n = 1.0 / f64::from(n);
-    let r_base = planet.radius_meters();
-    let min_r = 1.0_f64.min(r_base * 0.5);
-    let cell_arc = planet.cell_arc_length_meters(tile.lod);
-    let tuck_m = (cell_arc * 0.08).clamp(0.5, 45.0);
-    let vertex_count = terrain_positions_ecef.len();
+    n: u32,
+    stride: usize,
+    r_base: f64,
+    min_r: f64,
+    unit_dirs: &[EcefMeters],
+    positions_ecef: &[EcefMeters],
+    sampler: &dyn ElevationSampler,
+    world: Option<&TerrainWorld>,
+) -> Vec<[f32; 3]> {
+    if world.is_none() && sampler.global_range().is_flat() {
+        return unit_dirs
+            .iter()
+            .map(|u| [u.x as f32, u.y as f32, u.z as f32])
+            .collect();
+    }
 
-    let mut positions = Vec::with_capacity(vertex_count);
-    let mut normals = Vec::with_capacity(vertex_count);
-    let mut colors = Vec::with_capacity(vertex_count);
-    let mut idx = 0_usize;
+    let d_theta = (planet.cell_arc_length_meters(tile.lod) / r_base).clamp(1e-7, 0.05);
+    let (sin_d, cos_d) = d_theta.sin_cos();
+    let mut normals = Vec::with_capacity(unit_dirs.len());
 
     for iy in 0..=n {
-        let v = f64::from(iy) * inv_n;
+        let row = iy as usize;
         for ix in 0..=n {
-            let u = f64::from(ix) * inv_n;
-            let unit_dir =
-                face_uv_to_unit(tile.face, tile.tile_uv_to_face_uv(TileUv::clamped(u, v)));
-            let water = world.sample_water(unit_dir);
-            let (ecef, rgb) = if water.kind == WaterBodyKind::Dry {
-                let terrain_r = terrain_positions_ecef[idx].norm();
-                let tucked_r = (terrain_r - tuck_m).max(min_r);
-                (unit_dir.scale(tucked_r), shore_hint_rgb)
+            let col = ix as usize;
+            let idx = row * stride + col;
+            let unit_dir = unit_dirs[idx];
+
+            let normal = if ix == 0 || ix == n || iy == 0 || iy == n {
+                perimeter_canonical_normal(
+                    planet, r_base, min_r, unit_dir, sin_d, cos_d, sampler, world,
+                )
             } else {
-                let surf_r = (r_base + water.surface_elevation_m).max(min_r);
-                (unit_dir.scale(surf_r), water_surface_srgb(water))
+                let dp_u = positions_ecef[idx + 1] - positions_ecef[idx - 1];
+                let dp_v = positions_ecef[idx + stride] - positions_ecef[idx - stride];
+                dp_u.cross(dp_v)
+                    .normalized()
+                    .ok()
+                    .filter(|n_vec| n_vec.dot(unit_dir) > 0.0)
+                    .unwrap_or(unit_dir)
             };
-            positions.push(tile_origin.to_render_vec3(ecef).to_array());
-            normals.push([unit_dir.x as f32, unit_dir.y as f32, unit_dir.z as f32]);
-            colors.push(srgb_to_linear_rgba(rgb));
-            idx += 1;
+            normals.push([normal.x as f32, normal.y as f32, normal.z as f32]);
         }
     }
-
-    TileColoredMesh {
-        positions,
-        normals,
-        uvs,
-        colors,
-        indices,
-    }
-}
-
-#[inline]
-fn srgb_to_linear_rgba(rgb: [f32; 3]) -> [f32; 4] {
-    Color::srgb(rgb[0], rgb[1], rgb[2])
-        .to_linear()
-        .to_f32_array()
+    normals
 }
 
 #[expect(
-    clippy::cast_possible_truncation,
-    reason = "normalized depth blend factors narrow cleanly to f32"
+    clippy::too_many_arguments,
+    reason = "seam-canonical tangent-plane normal evaluation shares precomputed angular step"
 )]
-fn water_surface_srgb(water: WaterSample) -> [f32; 3] {
-    match water.kind {
-        WaterBodyKind::Ocean => {
-            let d = water.depth_m.max(0.0);
-            if d < 12.0 {
-                let t = (d / 12.0).clamp(0.0, 1.0) as f32;
-                lerp_rgb([0.11, 0.48, 0.56], [0.08, 0.39, 0.51], t)
-            } else if d < 200.0 {
-                let t = ((d - 12.0) / 188.0).clamp(0.0, 1.0) as f32;
-                lerp_rgb([0.08, 0.39, 0.51], [0.03, 0.20, 0.38], t)
-            } else {
-                let t = ((d - 200.0) / 4_000.0).clamp(0.0, 1.0) as f32;
-                lerp_rgb([0.03, 0.20, 0.38], [0.012, 0.065, 0.17], t)
-            }
-        }
-        WaterBodyKind::River(_) => [0.06, 0.29, 0.42],
-        WaterBodyKind::Lake(_) => {
-            if water.is_freshwater {
-                [0.04, 0.24, 0.43]
-            } else {
-                [0.06, 0.31, 0.38]
-            }
-        }
-        WaterBodyKind::Dry => [0.07, 0.34, 0.46],
-    }
-}
+fn perimeter_canonical_normal(
+    planet: PlanetSpec,
+    r_base: f64,
+    min_r: f64,
+    unit_dir: EcefMeters,
+    sin_d: f64,
+    cos_d: f64,
+    sampler: &dyn ElevationSampler,
+    world: Option<&TerrainWorld>,
+) -> EcefMeters {
+    let (t1, t2) = canonical_tangent_basis(unit_dir);
+    let u1_pos = (unit_dir.scale(cos_d) + t1.scale(sin_d))
+        .normalized()
+        .unwrap_or(unit_dir);
+    let u1_neg = (unit_dir.scale(cos_d) - t1.scale(sin_d))
+        .normalized()
+        .unwrap_or(unit_dir);
+    let u2_pos = (unit_dir.scale(cos_d) + t2.scale(sin_d))
+        .normalized()
+        .unwrap_or(unit_dir);
+    let u2_neg = (unit_dir.scale(cos_d) - t2.scale(sin_d))
+        .normalized()
+        .unwrap_or(unit_dir);
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "normalized bathymetric blend factors narrow cleanly to f32"
-)]
-fn seabed_srgb(depth_m: f64, slope_sin: f64) -> [f32; 3] {
-    let d = depth_m.max(0.0);
-    let mut rgb = if d < 15.0 {
-        let t = (d / 15.0).clamp(0.0, 1.0) as f32;
-        lerp_rgb([0.52, 0.48, 0.37], [0.36, 0.36, 0.32], t)
-    } else if d < 200.0 {
-        let t = ((d - 15.0) / 185.0).clamp(0.0, 1.0) as f32;
-        lerp_rgb([0.36, 0.36, 0.32], [0.21, 0.24, 0.27], t)
-    } else {
-        let t = ((d - 200.0) / 4_000.0).clamp(0.0, 1.0) as f32;
-        lerp_rgb([0.21, 0.24, 0.27], [0.09, 0.11, 0.15], t)
+    let sample_pos = |u: EcefMeters| -> EcefMeters {
+        let elev = if let Some(w) = world {
+            let e = w.sample_elevation_unit_prevalidated(u);
+            if e.is_finite() {
+                e.max(min_r - r_base)
+            } else {
+                0.0
+            }
+        } else {
+            sample_clamped_elevation(planet, u, sampler)
+        };
+        u.scale((r_base + elev).max(min_r))
     };
-    let slope_rock = ((slope_sin - 0.18) / 0.45).clamp(0.0, 1.0) as f32;
-    if slope_rock > 0.0 {
-        rgb = lerp_rgb(rgb, [0.18, 0.19, 0.21], slope_rock * 0.55);
-    }
-    rgb
-}
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "normalized riverbed depth factor narrows cleanly to f32"
-)]
-fn riverbed_srgb(depth_m: f64) -> [f32; 3] {
-    let t = (depth_m.max(0.0) / 40.0).clamp(0.0, 1.0) as f32;
-    lerp_rgb([0.38, 0.34, 0.27], [0.22, 0.21, 0.19], t)
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "normalized lakebed depth factor narrows cleanly to f32"
-)]
-fn lakebed_srgb(depth_m: f64) -> [f32; 3] {
-    let t = (depth_m.max(0.0) / 400.0).clamp(0.0, 1.0) as f32;
-    lerp_rgb([0.34, 0.34, 0.29], [0.15, 0.17, 0.19], t)
-}
-
-#[inline]
-fn lerp_rgb(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    [
-        a[0] + (b[0] - a[0]) * t,
-        a[1] + (b[1] - a[1]) * t,
-        a[2] + (b[2] - a[2]) * t,
-    ]
+    let dp1 = sample_pos(u1_pos) - sample_pos(u1_neg);
+    let dp2 = sample_pos(u2_pos) - sample_pos(u2_neg);
+    dp1.cross(dp2)
+        .normalized()
+        .ok()
+        .filter(|n_vec| n_vec.dot(unit_dir) > 0.0)
+        .unwrap_or(unit_dir)
 }

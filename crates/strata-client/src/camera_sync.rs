@@ -188,7 +188,7 @@ pub fn setup_camera_and_lighting(
 
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.75, 0.82, 0.95),
-        brightness: 420.0,
+        brightness: 680.0,
         affects_lightmapped_meshes: true,
     });
 }

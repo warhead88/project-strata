@@ -1,13 +1,12 @@
-use std::collections::{HashMap, HashSet};
-
+use bevy::mesh::Indices;
 use strata_globe::{
-    CoarserEdges, EcefMeters, GlobeError, LocalOrigin, RenderVec3, SelectedTile, TileEdge, TileId,
+    CoarserEdges, CubeFace, EcefMeters, GlobeError, LocalOrigin, RenderVec3, TileEdge, TileId,
     build_stitched_indices, build_tile_mesh_f64_with_elevation, ecef_to_tile_uv,
 };
 use strata_terrain::{TerrainWorld, lat_lon_to_unit};
 
-use crate::tile_mesh_build::build_tile_meshes;
-use crate::tile_streaming::{MAX_CACHED_TILES, MAX_DISPATCH_PER_FRAME, TileStreamPlanner};
+use crate::tile_cache::StitchedIndexTable;
+use crate::tile_mesh_build::{build_tile_meshes, to_bevy_mesh};
 
 fn tile_at(
     world: &TerrainWorld,
@@ -37,7 +36,7 @@ fn high_dry_himalayan_tile_produces_colored_terrain_without_water_mesh() -> Resu
     let world = TerrainWorld::earth_default();
     let planet = world.planet();
     let tile = tile_at(&world, 30.0, 87.0, 8)?;
-    let built = build_tile_meshes(planet, tile, CoarserEdges::NONE, 1, &world, Some(&world));
+    let built = build_tile_meshes(planet, tile, 1, &world, Some(&world));
 
     assert!(strata_globe::ElevationSampler::tile_range(&world, planet, tile).min_meters > 0.0);
     assert_eq!(built.tile, tile);
@@ -62,6 +61,8 @@ fn ocean_lake_and_river_tiles_produce_stitched_water_meshes() -> Result<(), Glob
         .with_edge(TileEdge::Bottom, true)
         .with_edge(TileEdge::Right, true);
     let expected_indices = build_stitched_indices(planet.grid_segments(), coarser);
+    let table = StitchedIndexTable::new(planet.grid_segments());
+    assert_eq!(table.indices(coarser), expected_indices.as_slice());
 
     let cases = [
         ("Pacific Ocean", tile_at(&world, 0.0, -150.0, 4)?),
@@ -70,7 +71,7 @@ fn ocean_lake_and_river_tiles_produce_stitched_water_meshes() -> Result<(), Glob
     ];
 
     for (label, tile) in cases {
-        let built = build_tile_meshes(planet, tile, coarser, 0, &world, Some(&world));
+        let built = build_tile_meshes(planet, tile, 0, &world, Some(&world));
         let Some(water) = built.water_mesh else {
             return Err(GlobeError::InvalidTileCoord {
                 lod: tile.lod,
@@ -78,14 +79,17 @@ fn ocean_lake_and_river_tiles_produce_stitched_water_meshes() -> Result<(), Glob
                 y: tile.y,
             });
         };
-        assert_eq!(
-            water.indices, expected_indices,
-            "{label} water mesh indices must match CoarserEdges stitching"
-        );
         assert_eq!(water.colors.len(), water.positions.len());
         assert_eq!(water.normals.len(), water.positions.len());
         assert_valid_linear_colors(&water.colors);
         assert_valid_linear_colors(&built.terrain_mesh.colors);
+
+        let bevy_water = to_bevy_mesh(water, table.indices(coarser));
+        assert_eq!(
+            bevy_water.indices(),
+            Some(&Indices::U32(expected_indices.clone())),
+            "{label} water mesh indices must match CoarserEdges stitching"
+        );
     }
     Ok(())
 }
@@ -97,8 +101,7 @@ fn tile_local_origin_transform_reconstructs_ecef_within_1mm_after_rebase() -> Re
     let planet = world.planet();
     let tile = tile_at(&world, 28.0, 86.9, 12)?;
 
-    // Build tile mesh once in tile-local coordinates.
-    let built = build_tile_meshes(planet, tile, CoarserEdges::NONE, 0, &world, Some(&world));
+    let built = build_tile_meshes(planet, tile, 0, &world, Some(&world));
     let truth = build_tile_mesh_f64_with_elevation(planet, tile, CoarserEdges::NONE, &world);
 
     let center_ecef = built.tile_origin.ecef;
@@ -137,109 +140,52 @@ fn tile_local_origin_transform_reconstructs_ecef_within_1mm_after_rebase() -> Re
 }
 
 #[test]
-fn stream_planner_keeps_ancestor_fallback_and_enforces_budgets_and_lru() -> Result<(), GlobeError> {
-    let parent = TileId::new(strata_globe::CubeFace::PosZ, 2, 1, 1)?;
-    let Some(children) = parent.children() else {
-        return Err(GlobeError::InvalidTileCoord {
-            lod: parent.lod,
-            x: parent.x,
-            y: parent.y,
-        });
-    };
+fn single_pass_mesh_builder_matches_seam_positions_and_normals_across_tiles()
+-> Result<(), GlobeError> {
+    let world = TerrainWorld::earth_default();
+    let planet = world.planet();
+    let stride = (planet.grid_segments() + 1) as usize;
+    let n = planet.grid_segments() as usize;
 
-    let desired_children: Vec<SelectedTile> = children
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| SelectedTile {
-            id,
-            coarser_edges: CoarserEdges::NONE,
-            distance_meters: 10_000.0 + f64::from(u32::try_from(i).unwrap_or(0)) * 500.0,
-            sse_px: 4.0,
-        })
-        .collect();
+    // 1. Intra-face vertical seam: PosZ (x=1, y=1) right edge == PosZ (x=2, y=1) left edge.
+    let left_tile = TileId::new(CubeFace::PosZ, 3, 1, 1)?;
+    let right_tile = TileId::new(CubeFace::PosZ, 3, 2, 1)?;
+    let left_mesh = build_tile_meshes(planet, left_tile, 0, &world, Some(&world));
+    let right_mesh = build_tile_meshes(planet, right_tile, 0, &world, Some(&world));
 
-    // 1. Zoom-in fallback: parent remains visible while children are pending or partially built.
-    let mut ready = HashSet::from([parent]);
-    let vis_0 = TileStreamPlanner::compute_visible_tiles(&desired_children, &ready);
-    assert_eq!(vis_0, HashSet::from([parent]));
-
-    ready.insert(children[0]);
-    ready.insert(children[1]);
-    let vis_partial = TileStreamPlanner::compute_visible_tiles(&desired_children, &ready);
-    assert_eq!(vis_partial, HashSet::from([parent]));
-
-    ready.insert(children[2]);
-    ready.insert(children[3]);
-    let vis_complete = TileStreamPlanner::compute_visible_tiles(&desired_children, &ready);
-    assert_eq!(vis_complete, HashSet::from(children));
-
-    // 2. Zoom-out fallback: ready children stay visible while coarse parent builds.
-    let desired_parent = [SelectedTile {
-        id: parent,
-        coarser_edges: CoarserEdges::NONE,
-        distance_meters: 50_000.0,
-        sse_px: 2.0,
-    }];
-    let ready_children_only = HashSet::from(children);
-    let vis_zoom_out =
-        TileStreamPlanner::compute_visible_tiles(&desired_parent, &ready_children_only);
-    assert_eq!(vis_zoom_out, HashSet::from(children));
-
-    // 3. Per-frame dispatch budget prioritizes closest tiles and skips up-to-date cached/in-flight tiles.
-    let planner = TileStreamPlanner::new(crate::tile_streaming::TileStreamBudget::default());
-    let mut many_desired = Vec::new();
-    for y in 0..5_u32 {
-        for x in 0..4_u32 {
-            let id = TileId::new(strata_globe::CubeFace::PosX, 5, x, y)?;
-            many_desired.push(SelectedTile {
-                id,
-                coarser_edges: CoarserEdges::NONE,
-                distance_meters: f64::from(20 - (y * 4 + x)) * 1_000.0,
-                sse_px: 5.0,
-            });
-        }
-    }
-    let cached_edges = HashMap::from([(many_desired[19].id, CoarserEdges::NONE)]);
-    let in_flight_edges = HashMap::from([(many_desired[18].id, CoarserEdges::NONE)]);
-    let dispatches = planner.plan_dispatches(&many_desired, &cached_edges, &in_flight_edges);
-    assert_eq!(dispatches.len(), MAX_DISPATCH_PER_FRAME);
-    for pair in dispatches.windows(2) {
-        assert!(pair[0].distance_meters <= pair[1].distance_meters);
-    }
-    assert!(!dispatches.iter().any(|d| d.id == many_desired[19].id));
-    assert!(!dispatches.iter().any(|d| d.id == many_desired[18].id));
-
-    // 4. LRU eviction keeps cache capped at MAX_CACHED_TILES and never evicts visible tiles.
-    let total = MAX_CACHED_TILES + 8;
-    let mut last_used = HashMap::with_capacity(total);
-    let mut visible_lru = HashSet::new();
-    let mut all_ids = Vec::with_capacity(total);
-    for idx in 0..total {
-        let lod = 10_u8;
-        let x = u32::try_from(idx % 512).unwrap_or(0);
-        let y = u32::try_from(idx / 512).unwrap_or(0);
-        let id = TileId::new(strata_globe::CubeFace::PosY, lod, x, y)?;
-        last_used.insert(id, u64::try_from(idx + 1).unwrap_or(1));
-        if idx < 5 {
-            visible_lru.insert(id);
-        }
-        all_ids.push(id);
-    }
-    let evicted = planner.plan_evictions(&last_used, &visible_lru);
-    assert_eq!(evicted.len(), 8);
-    for vis_id in &visible_lru {
-        assert!(!evicted.contains(vis_id));
-    }
-    for (offset, expected_id) in all_ids.iter().skip(5).take(8).enumerate() {
-        assert_eq!(evicted[offset], *expected_id);
+    for iy in 0..=n {
+        let l_idx = iy * stride + n;
+        let r_idx = iy * stride;
+        assert_eq!(
+            left_mesh.terrain_mesh.normals[l_idx].map(f32::to_bits),
+            right_mesh.terrain_mesh.normals[r_idx].map(f32::to_bits),
+            "intra-face seam normal mismatch at iy={iy}"
+        );
+        let l_p = left_mesh.terrain_mesh.positions[l_idx];
+        let r_p = right_mesh.terrain_mesh.positions[r_idx];
+        let l_ecef = left_mesh.tile_origin.ecef
+            + EcefMeters::from_raw(f64::from(l_p[0]), f64::from(l_p[1]), f64::from(l_p[2]));
+        let r_ecef = right_mesh.tile_origin.ecef
+            + EcefMeters::from_raw(f64::from(r_p[0]), f64::from(r_p[1]), f64::from(r_p[2]));
+        assert!(
+            l_ecef.distance_to(r_ecef) <= 0.25,
+            "intra-face seam position gap at iy={iy}"
+        );
     }
 
-    // 5. Verify TerrainElevation::set_world switches from flat to Earth TerrainWorld and bumps revision.
-    let mut terrain = crate::terrain::TerrainElevation::default();
-    assert!(terrain.world().is_none());
-    assert_eq!(terrain.revision(), 0);
-    terrain.set_world(std::sync::Arc::new(TerrainWorld::earth_default()));
-    assert!(terrain.world().is_some());
-    assert_eq!(terrain.revision(), 1);
+    // 2. Cross-face cube edge seam: PosZ right edge (u=1) == PosX left edge (u=0).
+    let face_z = TileId::new(CubeFace::PosZ, 2, 3, 1)?;
+    let face_x = TileId::new(CubeFace::PosX, 2, 0, 1)?;
+    let mesh_z = build_tile_meshes(planet, face_z, 0, &world, Some(&world));
+    let mesh_x = build_tile_meshes(planet, face_x, 0, &world, Some(&world));
+    for iy in 0..=n {
+        let z_idx = iy * stride + n;
+        let x_idx = iy * stride;
+        assert_eq!(
+            mesh_z.terrain_mesh.normals[z_idx].map(f32::to_bits),
+            mesh_x.terrain_mesh.normals[x_idx].map(f32::to_bits),
+            "cube-edge seam normal mismatch at iy={iy}"
+        );
+    }
     Ok(())
 }

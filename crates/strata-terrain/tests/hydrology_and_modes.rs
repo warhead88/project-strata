@@ -111,38 +111,10 @@ fn hydrology_invariants_rivers_lakes_and_bathymetry() {
 }
 
 #[test]
-fn procedural_small_planet_and_dem_roundtrip() -> Result<(), TerrainError> {
+fn custom_dem_small_planet_and_roundtrip() -> Result<(), TerrainError> {
     let small_planet = PlanetSpec::new(200_000.0, 14, 16)?;
-    let proc_world = TerrainWorld::new(
-        TerrainConfig::procedural(42)
-            .with_planet(small_planet)
-            .with_macro_resolution(64),
-    )?;
-    assert_eq!(proc_world.planet(), small_planet);
-    assert_eq!(proc_world.macro_resolution(), 64);
 
-    let clamped = proc_world.global_range().clamp_planet_radius(small_planet);
-    assert!(small_planet.radius_meters() + clamped.min_meters > 0.0);
-
-    for river in proc_world.rivers() {
-        for pair in river.waypoints.windows(2) {
-            assert!(pair[1].surface_elevation_m <= pair[0].surface_elevation_m);
-        }
-    }
-
-    for tile in TileId::roots() {
-        let range = proc_world.tile_range(small_planet, tile);
-        for sy in 0..=4 {
-            for sx in 0..=4 {
-                let uv = TileUv::clamped(f64::from(sx) * 0.25, f64::from(sy) * 0.25);
-                let unit = face_uv_to_unit(tile.face, tile.tile_uv_to_face_uv(uv));
-                let elev = proc_world.sample_elevation(unit);
-                assert!(elev >= range.min_meters && elev <= range.max_meters);
-            }
-        }
-    }
-
-    // DEM round-trip: constant +750 m above equator, -1500 m below equator (roughness ~ 0.1..0.2).
+    // DEM round-trip on a small planet: +750 m above equator, -1500 m below equator.
     let w = 64_usize;
     let h = 32_usize;
     let mut grid_data = Vec::with_capacity(w * h);
@@ -153,7 +125,29 @@ fn procedural_small_planet_and_dem_roundtrip() -> Result<(), TerrainError> {
         }
     }
     let dem = DemGrid::new(w, h, grid_data)?;
-    let dem_world = TerrainWorld::new(TerrainConfig::from_dem(dem, 7).with_macro_resolution(32))?;
+    let dem_world = TerrainWorld::new(
+        TerrainConfig::from_dem(dem, 7)
+            .with_planet(small_planet)
+            .with_macro_resolution(32),
+    )?;
+    assert_eq!(dem_world.planet(), small_planet);
+    assert_eq!(dem_world.macro_resolution(), 32);
+
+    let clamped = dem_world.global_range().clamp_planet_radius(small_planet);
+    assert!(small_planet.radius_meters() + clamped.min_meters > 0.0);
+
+    for tile in TileId::roots() {
+        let range = dem_world.tile_range(small_planet, tile);
+        for sy in 0..=4 {
+            for sx in 0..=4 {
+                let uv = TileUv::clamped(f64::from(sx) * 0.25, f64::from(sy) * 0.25);
+                let unit = face_uv_to_unit(tile.face, tile.tile_uv_to_face_uv(uv));
+                let elev = dem_world.sample_elevation(unit);
+                assert!(elev >= range.min_meters && elev <= range.max_meters);
+            }
+        }
+    }
+
     let north_sample = dem_world.sample_elevation(lat_lon_to_unit(45.0, 20.0));
     let south_sample = dem_world.sample_elevation(lat_lon_to_unit(-45.0, 20.0));
     assert!(
@@ -216,4 +210,37 @@ fn performance_and_determinism_sanity() {
         sample_elapsed.as_secs_f64() < 5.0,
         "50k queries took too long: {sample_elapsed:?}"
     );
+
+    let planet = world_a.planet();
+    let cam = strata_globe::CameraViewF64::look_at(
+        lat_lon_to_unit(27.85, 86.75).scale(planet.radius_meters() + 18_000.0),
+        lat_lon_to_unit(28.0, 86.9).scale(planet.radius_meters() + 4_500.0),
+        strata_globe::EcefMeters::from_raw(0.0, 1.0, 0.0),
+        60.0_f64.to_radians(),
+        16.0 / 9.0,
+        1080.0,
+    );
+    assert!(cam.is_ok());
+    if let Ok(view) = cam {
+        let mut split = std::collections::HashSet::new();
+        let t_lod = Instant::now();
+        for _ in 0..50 {
+            let sel = strata_globe::select_tiles_with_elevation(
+                planet,
+                &view,
+                strata_globe::LodConfig::standard(),
+                &mut split,
+                &world_a,
+            );
+            assert!(sel.is_ok());
+            if let Ok(s) = sel {
+                assert!(!s.tiles.is_empty());
+            }
+        }
+        let lod_elapsed = t_lod.elapsed();
+        assert!(
+            lod_elapsed.as_secs_f64() < 5.0,
+            "50 LOD selections took too long: {lod_elapsed:?}"
+        );
+    }
 }

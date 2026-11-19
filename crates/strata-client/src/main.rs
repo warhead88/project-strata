@@ -4,16 +4,22 @@ mod camera_sync;
 mod clock;
 mod compass;
 mod globe_debug;
+mod globe_materials;
 mod globe_render;
+mod hud;
 mod markers;
 mod snapshot;
 mod terrain;
+mod tile_async_queue;
 mod tile_cache;
 mod tile_mesh_build;
+mod tile_mesh_colors;
 mod tile_streaming;
 
 #[cfg(test)]
 mod terrain_render_tests;
+#[cfg(test)]
+mod terrain_streaming_tests;
 
 use bevy::log::{Level, LogPlugin};
 use bevy::prelude::*;
