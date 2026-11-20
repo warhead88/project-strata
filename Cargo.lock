@@ -5005,9 +5005,11 @@ name = "strata-client"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytemuck",
  "strata-globe",
  "strata-simulation",
  "strata-terrain",
+ "wgpu",
 ]
 
 [[package]]

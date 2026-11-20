@@ -7,6 +7,8 @@ publish.workspace = true
 
 [dependencies]
 bevy.workspace = true
+bytemuck.workspace = true
+wgpu.workspace = true
 strata-globe.workspace = true
 strata-simulation.workspace = true
 strata-terrain.workspace = true

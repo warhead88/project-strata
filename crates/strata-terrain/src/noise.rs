@@ -57,9 +57,16 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
+/// Returns the gradient index for a signed lattice coordinate and octave seed.
+#[must_use]
+#[inline]
+pub const fn gradient_index(ix: i32, iy: i32, iz: i32, seed: u64) -> u32 {
+    (hash3(ix, iy, iz, seed) & 15) as u32
+}
+
 #[inline]
 fn grad_dot(ix: i32, iy: i32, iz: i32, dx: f64, dy: f64, dz: f64, seed: u64) -> f64 {
-    let idx = (hash3(ix, iy, iz, seed) & 15) as usize;
+    let idx = gradient_index(ix, iy, iz, seed) as usize;
     let g = GRADIENTS[idx];
     g[0] * dx + g[1] * dy + g[2] * dz
 }

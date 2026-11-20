@@ -4,8 +4,7 @@ use bevy::prelude::*;
 use strata_globe::{CameraViewF64, EcefMeters, ElevationSampler, FlatElevation, PlanetSpec};
 use strata_terrain::TerrainWorld;
 
-/// Client-side terrain relief sampler resource with monotonic revision tracking
-/// so changing terrain invalidates cached GPU tile meshes cleanly.
+/// Client-side terrain and its revision for invalidating resident surface data or CPU meshes.
 #[derive(Resource, Clone)]
 pub struct TerrainElevation {
     sampler: Arc<dyn ElevationSampler>,

@@ -7,9 +7,10 @@ use strata_globe::{
 };
 
 use crate::camera::{GlobeCameraState, OriginState};
+use crate::globe_debug::TerrainDebug;
 use crate::globe_materials::{GlobeMaterials, SelectionKey};
-use crate::snapshot::ClientWorldView;
 use crate::terrain::TerrainElevation;
+use crate::terrain_backend::TerrainBackend;
 use crate::tile_async_queue::TileAsyncQueue;
 use crate::tile_cache::{
     CachedTile, StitchedIndexTable, TileEntityQuery, TileSyncFrame, despawn_cached_tile,
@@ -50,8 +51,6 @@ pub struct GlobeRenderState {
     pub min_lod: u8,
     /// Maximum LOD among active tiles.
     pub max_lod: u8,
-    /// When `true`, switches tiles to cube-face grid materials and renders seam gizmos.
-    pub debug_overlay: bool,
 }
 
 impl GlobeRenderState {
@@ -81,23 +80,41 @@ impl GlobeRenderState {
             pending_task_count: 0,
             min_lod: 0,
             max_lod: 0,
-            debug_overlay: false,
         }
     }
 
-    fn terrain_material_for(&self, tile: TileId) -> Handle<StandardMaterial> {
-        self.materials.terrain_for(tile, self.debug_overlay)
+    fn clear_surface(&mut self, commands: &mut Commands, meshes: &mut Assets<Mesh>) {
+        self.stream_queue.cancel_all();
+        for (_, tile) in self.tiles.drain() {
+            despawn_cached_tile(commands, meshes, tile);
+        }
+    }
+
+    fn terrain_material_for(&self, tile: TileId, debug: bool) -> Handle<StandardMaterial> {
+        self.materials.terrain_for(tile, debug)
     }
 }
 
-/// Startup system initializing tile materials and render cache.
-pub fn setup_globe_materials(
+/// Installs or retires the CPU tile cache when the selected backend changes.
+#[expect(clippy::needless_pass_by_value, reason = "Bevy system parameters")]
+pub(crate) fn reconcile_cpu_terrain(
     mut commands: Commands,
+    backend: Res<TerrainBackend>,
+    state: Option<ResMut<GlobeRenderState>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    let state = GlobeRenderState::initialize(&mut images, &mut materials);
-    commands.insert_resource(state);
+    match (backend.uses_gpu(), state) {
+        (false, None) => {
+            commands.insert_resource(GlobeRenderState::initialize(&mut images, &mut materials));
+        }
+        (true, Some(mut state)) => {
+            state.clear_surface(&mut commands, &mut meshes);
+            commands.remove_resource::<GlobeRenderState>();
+        }
+        (false, Some(_)) | (true, None) => {}
+    }
 }
 
 /// Synchronizes visible Bevy tile meshes asynchronously with [`select_tiles_with_elevation`]
@@ -110,10 +127,10 @@ pub fn setup_globe_materials(
 pub fn sync_globe_tiles(
     mut commands: Commands,
     windows: Query<&Window>,
-    world_view: Res<ClientWorldView>,
     terrain: Res<TerrainElevation>,
     cam_state: Res<GlobeCameraState>,
     origin_state: Res<OriginState>,
+    debug: Res<TerrainDebug>,
     mut render_state: ResMut<GlobeRenderState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut tile_query: TileEntityQuery<'_, '_>,
@@ -128,17 +145,13 @@ pub fn sync_globe_tiles(
         return;
     };
 
-    let planet = world_view.snapshot().planet;
+    let planet = cam_state.planet;
     let terrain_rev = terrain.revision();
     if render_state.baked_planet != Some(planet)
         || render_state.baked_terrain_revision != Some(terrain_rev)
     {
-        let drained: Vec<CachedTile> = render_state.tiles.drain().map(|(_, v)| v).collect();
-        for cached in drained {
-            despawn_cached_tile(&mut commands, &mut meshes, cached);
-        }
+        render_state.clear_surface(&mut commands, &mut meshes);
         render_state.previously_split.clear();
-        render_state.stream_queue.cancel_all();
         if render_state.index_table.grid_segments() != planet.grid_segments() {
             render_state.index_table = StitchedIndexTable::new(planet.grid_segments());
         }
@@ -152,7 +165,7 @@ pub fn sync_globe_tiles(
     let selection_key = SelectionKey::new(&cam_view, planet, terrain_rev, render_state.lod_config);
     let selection_unchanged = render_state.last_selection_key == Some(selection_key);
     let origin_changed = render_state.last_origin != Some(origin_state.origin);
-    let overlay_changed = render_state.applied_debug_overlay != render_state.debug_overlay;
+    let overlay_changed = render_state.applied_debug_overlay != debug.0;
 
     // Zero-work idle fast path: camera, terrain, origin, overlay unchanged and streaming complete.
     if selection_unchanged
@@ -191,7 +204,7 @@ pub fn sync_globe_tiles(
         &terrain,
         origin_state.origin,
         origin_changed,
-        overlay_changed,
+        debug.0,
         &selection,
     );
     render_state.last_selection = selection;
@@ -210,7 +223,7 @@ fn apply_tile_streaming_frame(
     terrain: &TerrainElevation,
     origin: LocalOrigin,
     origin_changed: bool,
-    overlay_changed: bool,
+    debug: bool,
     selection: &TileSelection,
 ) {
     let terrain_rev = terrain.revision();
@@ -237,7 +250,7 @@ fn apply_tile_streaming_frame(
                 .copied()
                 .unwrap_or(CoarserEdges::NONE);
             let indices = render_state.index_table.indices(target_edges);
-            let terrain_mat = render_state.terrain_material_for(built.tile);
+            let terrain_mat = render_state.terrain_material_for(built.tile, debug);
             let water_mat = render_state.materials.water.clone();
             upload_built_tile(
                 commands,
@@ -308,13 +321,13 @@ fn apply_tile_streaming_frame(
         TileSyncFrame {
             origin,
             origin_changed,
-            overlay_changed,
+            overlay_changed: render_state.applied_debug_overlay != debug,
         },
         &render_state.visible_scratch,
-        |tile_id| render_state.terrain_material_for(tile_id),
+        |tile_id| render_state.terrain_material_for(tile_id, debug),
     );
     render_state.last_origin = Some(origin);
-    render_state.applied_debug_overlay = render_state.debug_overlay;
+    render_state.applied_debug_overlay = debug;
 
     evict_excess_tiles(commands, meshes, render_state, min_pinned_lod);
     render_state.all_desired_ready = selection
