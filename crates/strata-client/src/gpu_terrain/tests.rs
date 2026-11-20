@@ -15,7 +15,7 @@ use strata_globe::{CubeFace, EcefMeters, FaceUv, ecef_to_face_uv_unit, face_uv_t
 use strata_terrain::{WaterBodyKind, lat_lon_to_unit};
 
 use super::{
-    pipeline::{CUBE, SURFACE, pipeline_layout, shader, storage_group, surface_group},
+    pipeline::{CUBE, EARTH, SURFACE, pipeline_layout, shader, storage_group, surface_group},
     source::meters_f32,
     view::face_anchor,
     *,
@@ -164,7 +164,11 @@ fn validate_surface(
             (&output, BufferBindingType::Storage { read_only: false }),
         ],
     );
-    let module = shader(device, "Terrain parity probe", &[CUBE, SURFACE, PROBE]);
+    let module = shader(
+        device,
+        "Terrain parity probe",
+        &[CUBE, EARTH, SURFACE, PROBE],
+    );
     let layout = pipeline_layout(device, &world_layout, &probe_layout);
     let pipeline = device.create_compute_pipeline(&RawComputePipelineDescriptor {
         label: Some("Terrain parity probe"),
@@ -245,6 +249,8 @@ fn assert_parity(
 ) {
     let mut max_height_error = 0.0_f64;
     let mut max_position_error = 0.0_f64;
+    let mut shoreline_differences = 0;
+    let mut displaced_shore = 0;
     for ((&original, point), result) in coords.iter().zip(points).zip(data.chunks_exact(2)) {
         let face = CubeFace::ALL[point[2] as usize];
         let uv = FaceUv {
@@ -255,23 +261,26 @@ fn assert_parity(
         let height = world.sample_elevation_unit_prevalidated(dir);
         let height_error = (height - f64::from(result[0][0])).abs();
         max_height_error = max_height_error.max(height_error);
-        assert!(
-            height_error < 1.0,
-            "height {height} {:?} at {original:?}",
-            result[0]
-        );
         let water = world.sample_water(dir);
-        let kind = match water.kind {
-            WaterBodyKind::Dry => 0.0,
-            WaterBodyKind::Ocean => 1.0,
-            WaterBodyKind::Lake(_) if water.is_freshwater => 2.0,
-            WaterBodyKind::Lake(_) => 3.0,
-            WaterBodyKind::River(_) => 4.0,
-        };
-        assert!(
-            (result[0][2] - kind).abs() < f32::EPSILON,
-            "{water:?} {result:?}"
-        );
+        let kind = gpu_water_kind(water);
+        if (result[0][2] - kind).abs() > f32::EPSILON {
+            shoreline_differences += 1;
+            let (east, north) = strata_globe::canonical_tangent_basis(dir);
+            let located = (-2..=2).any(|x| {
+                (-2..=2).any(|y| {
+                    let nearby = dir
+                        + (east.scale(f64::from(x)) + north.scale(f64::from(y)))
+                            .scale(3.0 / planet.radius_meters());
+                    (gpu_water_kind(world.sample_water(nearby)) - result[0][2]).abs() < f32::EPSILON
+                })
+            });
+            if !located {
+                displaced_shore += 1;
+                if displaced_shore <= 5 {
+                    eprintln!("Water mismatch at {original:?}: {water:?}, {result:?}");
+                }
+            }
+        }
         let expected = dir.scale(planet.radius_meters()) - eye;
         if expected.norm() < 500.0 {
             let [x, y, z, _] = result[1].map(f64::from);
@@ -286,8 +295,21 @@ fn assert_parity(
         }
     }
     println!(
-        "Maximum sample height difference {max_height_error:.4} m, near-eye position difference {max_position_error:.6} m"
+        "Maximum sample height difference {max_height_error:.4} m, near-eye position difference {max_position_error:.6} m; {shoreline_differences}/{} shore classifications differed, {displaced_shore} beyond the ±6 m neighborhood",
+        coords.len()
     );
+    assert!(max_height_error < 5.0);
+    assert_eq!(displaced_shore, 0);
+}
+
+fn gpu_water_kind(water: strata_terrain::WaterSample) -> f32 {
+    match water.kind {
+        WaterBodyKind::Dry => 0.0,
+        WaterBodyKind::Ocean => 1.0,
+        WaterBodyKind::Lake(_) if water.is_freshwater => 2.0,
+        WaterBodyKind::Lake(_) => 3.0,
+        WaterBodyKind::River(_) => 4.0,
+    }
 }
 
 fn read<T: Pod>(

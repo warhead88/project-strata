@@ -73,13 +73,15 @@ impl TerrainWorld {
     /// All river systems registered in this world.
     #[must_use]
     pub fn rivers(&self) -> &[RiverDef] {
-        self.hydrology.rivers()
+        self.earth_water
+            .as_ref()
+            .map_or(&[], |water| water.rivers())
     }
 
     /// All lakes and inland seas registered in this world.
     #[must_use]
     pub fn lakes(&self) -> &[LakeDef] {
-        self.hydrology.lakes()
+        self.earth_water.as_ref().map_or(&[], |water| water.lakes())
     }
 
     /// Returns the macro geology province identifier (`0..=7`) at `unit_dir`.

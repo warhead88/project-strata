@@ -24,10 +24,10 @@ pub(super) struct FaceAnchor {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(super) struct GpuView {
-    clip_from_eye: [[f32; 4]; 4],
+    pub(super) clip_from_eye: [[f32; 4]; 4],
     pub(super) anchors: [FaceAnchor; 6],
     pub(super) planet: [f32; 4],
-    eye: [f32; 4],
+    pub(super) eye: [f32; 4],
     pub(super) settings: [u32; 4],
     source: [u32; 4],
     detail: [u32; 4],
@@ -87,15 +87,10 @@ impl ExtractedTerrain {
             source: [
                 source.macro_resolution,
                 source.second_octave_offset,
-                source.bucket_dim,
+                0,
                 source.frequencies[0],
             ],
-            detail: [
-                source.frequencies[1],
-                source.hydrology_radius_m.to_bits(),
-                0,
-                0,
-            ],
+            detail: [source.frequencies[1], 0, 0, 0],
             material_origin: [
                 eye.x.rem_euclid(256.0),
                 eye.y.rem_euclid(256.0),

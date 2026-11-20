@@ -4,8 +4,8 @@ use strata_globe::{
 };
 
 use crate::earth_geography::{ElevationGridSource, MacroSample, TerrainSource};
+use crate::earth_water::EarthWater;
 use crate::error::TerrainError;
-use crate::hydrology_index::HydrologyIndex;
 use crate::macro_climate::{evaluate_dem_macro, evaluate_earth_macro};
 use crate::macro_mipmap::{MinMaxNode, build_mip_pyramid, compute_mip_layout};
 use crate::noise::noise3;
@@ -69,7 +69,7 @@ impl CubeMacroCache {
         resolution: u32,
         source: &TerrainSource,
         elevation_source: &ElevationGridSource,
-        hydrology: &HydrologyIndex,
+        water: Option<&EarthWater>,
     ) -> Result<Self, TerrainError> {
         if !(16..=512).contains(&resolution) || !resolution.is_power_of_two() {
             return Err(TerrainError::InvalidMacroResolution { resolution });
@@ -86,7 +86,7 @@ impl CubeMacroCache {
             elevation_source,
             &level_offsets,
             total_mip_per_face,
-            hydrology,
+            water,
         )?;
 
         Ok(Self {

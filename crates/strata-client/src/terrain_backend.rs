@@ -20,6 +20,7 @@ pub(crate) struct TerrainRenderKey {
 pub(crate) struct TerrainBackend {
     allow_gpu: bool,
     gpu_active: bool,
+    cpu_prepared: bool,
     evaluated: Option<TerrainRenderKey>,
 }
 
@@ -28,12 +29,16 @@ impl TerrainBackend {
         Self {
             allow_gpu,
             gpu_active: false,
+            cpu_prepared: false,
             evaluated: None,
         }
     }
 
     pub(crate) const fn uses_gpu(&self) -> bool {
         self.gpu_active
+    }
+    pub(crate) const fn uses_prepared_draw(&self) -> bool {
+        self.gpu_active || self.cpu_prepared
     }
 }
 
@@ -42,7 +47,7 @@ impl TerrainBackend {
     reason = "Bevy run condition receives Res<T> by value"
 )]
 pub(crate) fn use_cpu_terrain(backend: Res<TerrainBackend>) -> bool {
-    !backend.uses_gpu()
+    !backend.uses_prepared_draw()
 }
 
 #[expect(clippy::needless_pass_by_value, reason = "Bevy system parameters")]
@@ -63,7 +68,14 @@ pub(crate) fn choose_terrain_backend(
 
     let report_fallback = backend.evaluated.is_none() || backend.uses_gpu();
     backend.evaluated = Some(key);
-    backend.gpu_active = backend.allow_gpu && supports_gpu(key.planet, &terrain, &adapter, &device);
+    let supported = supports_gpu(key.planet, &terrain, &adapter, &device);
+    backend.gpu_active = backend.allow_gpu && supported;
+    backend.cpu_prepared = !backend.allow_gpu
+        && supported
+        && terrain
+            .world()
+            .and_then(|world| world.surface_data())
+            .is_some_and(|data| data.earth_water().is_some());
     if backend.allow_gpu && !backend.uses_gpu() && report_fallback {
         info!("Using CPU terrain for the current source and planet");
     }
@@ -93,10 +105,14 @@ fn supports_gpu(
         .world()
         .and_then(|world| world.surface_data())
         .is_some_and(|source| {
-            let (width, height, _) = source.raster();
+            let (width, height, raster) = source.raster();
+            let side = match raster {
+                strata_terrain::SurfaceRaster::Earth(_) => 5400,
+                strata_terrain::SurfaceRaster::Dem(_) => width.max(height),
+            };
             let resolution = u64::from(source.macro_grid().0);
             let bounds_bytes = 6 * 8 * (4 * resolution.pow(2) - 1) / 3;
-            width.max(height) <= limits.max_texture_dimension_2d as usize
+            side <= limits.max_texture_dimension_2d as usize
                 && bounds_bytes <= limits.max_storage_buffer_binding_size
         })
 }

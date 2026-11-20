@@ -5027,6 +5027,7 @@ dependencies = [
 name = "strata-terrain"
 version = "0.1.0"
 dependencies = [
+ "ruzstd",
  "strata-globe",
 ]
 

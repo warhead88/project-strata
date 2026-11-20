@@ -1,3 +1,5 @@
+mod cpu_selection;
+mod earth_textures;
 mod gradients;
 mod pipeline;
 mod source;
@@ -20,7 +22,7 @@ use bevy::render::{
     renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
     view::{ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget},
 };
-use bytemuck::bytes_of;
+use bytemuck::{bytes_of, cast_slice};
 use strata_globe::PlanetSpec;
 
 use crate::{
@@ -71,6 +73,7 @@ impl Plugin for TerrainRenderPlugin {
 #[derive(Resource)]
 struct ExtractedTerrainFrame {
     revision: u64,
+    cpu_lod: bool,
     gpu: Option<ExtractedTerrain>,
 }
 
@@ -93,7 +96,8 @@ fn extract_terrain(
 ) {
     commands.insert_resource(ExtractedTerrainFrame {
         revision: terrain.revision(),
-        gpu: backend.uses_gpu().then(|| ExtractedTerrain {
+        cpu_lod: !backend.uses_gpu(),
+        gpu: backend.uses_prepared_draw().then(|| ExtractedTerrain {
             camera: (**camera).clone(),
             debug: debug.0,
             terrain: (**terrain).clone(),
@@ -120,8 +124,10 @@ struct TerrainGpu {
     frame: Buffer,
     indirect: Buffer,
     indices: Buffer,
-    #[cfg(test)]
     land: Buffer,
+    water: Buffer,
+    index_count: u32,
+    cpu_tiles: cpu_selection::CpuSelection,
     reset: Buffer,
     selection: SelectPipeline,
     drawing: DrawPipelines,
@@ -149,13 +155,13 @@ impl TerrainGpu {
             device,
             "Terrain land instance list",
             TILE_CAPACITY * 16,
-            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
         );
         let water = allocate(
             device,
             "Terrain water instance list",
             TILE_CAPACITY * 16,
-            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
         );
         let index_data = grid_indices(planet.grid_segments());
         let index_count = u32::try_from(index_data.len()).ok()?;
@@ -178,14 +184,34 @@ impl TerrainGpu {
             frame,
             indirect,
             indices,
-            #[cfg(test)]
             land,
+            water,
+            index_count,
+            cpu_tiles: cpu_selection::CpuSelection::default(),
             reset,
             selection,
             drawing,
             pipelines: HashMap::new(),
         })
     }
+    fn upload_cpu_selection(
+        &mut self,
+        input: &ExtractedTerrain,
+        frame: &GpuView,
+        queue: &RenderQueue,
+    ) {
+        self.cpu_tiles.update(input, frame);
+        let tiles = &self.cpu_tiles.instances;
+        let count = u32::try_from(tiles.len()).unwrap_or(0);
+        if count > 0 {
+            let data = cast_slice(tiles);
+            queue.write_buffer(&self.land, 0, data);
+            queue.write_buffer(&self.water, 0, data);
+        }
+        let indirect = [[self.index_count, count, 0, 0, 0]; 2];
+        queue.write_buffer(&self.indirect, 0, bytes_of(&indirect));
+    }
+
     fn encode_selection(
         &self,
         encoder: &mut CommandEncoder,
@@ -280,9 +306,8 @@ fn render_terrain(
     )>,
     mut context: RenderContext,
 ) {
-    let Some(input) = frame.as_ref().and_then(|frame| frame.gpu.as_ref()) else {
-        return;
-    };
+    let Some(extracted) = frame else { return };
+    let Some(input) = &extracted.gpu else { return };
     let Some(gpu) = prepared.active.as_mut() else {
         return;
     };
@@ -292,7 +317,11 @@ fn render_terrain(
     queue.write_buffer(&gpu.frame, 0, bytes_of(&frame));
     let diagnostics = context.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
-    gpu.encode_selection(context.command_encoder(), frame.settings[0], diagnostics);
+    if extracted.cpu_lod {
+        gpu.upload_cpu_selection(input, &frame, &queue);
+    } else {
+        gpu.encode_selection(context.command_encoder(), frame.settings[0], diagnostics);
+    }
     let pipelines = gpu.pipelines.entry((format, samples)).or_insert_with(|| {
         let device = context.render_device();
         [false, true].map(|water| gpu.drawing.create(device, format, samples, water))

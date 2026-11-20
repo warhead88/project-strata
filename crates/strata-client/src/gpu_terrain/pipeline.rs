@@ -16,6 +16,7 @@ use super::source::SourceGpu;
 
 pub(super) const CUBE: &str = include_str!("cube.wgsl");
 const SELECT: &str = include_str!("select.wgsl");
+pub(super) const EARTH: &str = include_str!("earth_surface.wgsl");
 pub(super) const SURFACE: &str = include_str!("surface.wgsl");
 pub(super) const DRAW: &str = include_str!("draw.wgsl");
 
@@ -52,7 +53,6 @@ impl SelectPipeline {
                 (indirect, storage(false)),
                 (land, storage(false)),
                 (water, storage(false)),
-                (&source.buckets, storage(true)),
             ],
         );
         let module = shader(device, "Terrain selection WGSL", &[CUBE, SELECT]);
@@ -105,7 +105,11 @@ impl DrawPipelines {
             &tile_layout,
             &[entry(0, water.as_entire_binding())],
         );
-        let shader = shader(device, "Terrain surface WGSL", &[CUBE, SURFACE, DRAW]);
+        let shader = shader(
+            device,
+            "Terrain surface WGSL",
+            &[CUBE, EARTH, SURFACE, DRAW],
+        );
         let layout = pipeline_layout(device, &world_layout, &tile_layout);
         Self {
             shader,
@@ -184,8 +188,19 @@ pub(super) fn surface_group(
         texture_layout(1, stage, TextureViewDimension::D2),
         texture_layout(2, stage, TextureViewDimension::D2Array),
         buffer_layout(3, stage, storage(true)),
-        buffer_layout(4, stage, storage(true)),
-        buffer_layout(5, stage, storage(true)),
+        texture_layout_typed(
+            4,
+            stage,
+            TextureViewDimension::D2Array,
+            TextureSampleType::Sint,
+        ),
+        texture_layout_typed(5, stage, TextureViewDimension::D2, TextureSampleType::Uint),
+        texture_layout_typed(
+            6,
+            stage,
+            TextureViewDimension::D2Array,
+            TextureSampleType::Sint,
+        ),
     ];
     let world_layout = device.create_bind_group_layout("Terrain draw inputs", &bindings);
     let world = device.create_bind_group(
@@ -196,8 +211,9 @@ pub(super) fn surface_group(
             entry(1, BindingResource::TextureView(&source.dem)),
             entry(2, BindingResource::TextureView(&source.climate)),
             entry(3, source.gradients.as_entire_binding()),
-            entry(4, source.buckets.as_entire_binding()),
-            entry(5, source.features.as_entire_binding()),
+            entry(4, BindingResource::TextureView(&source.earth.relief)),
+            entry(5, BindingResource::TextureView(&source.earth.directory)),
+            entry(6, BindingResource::TextureView(&source.earth.pages)),
         ],
     );
     (world_layout, world)
@@ -262,13 +278,27 @@ fn texture_layout(
     visibility: ShaderStages,
     view_dimension: TextureViewDimension,
 ) -> BindGroupLayoutEntry {
+    texture_layout_typed(
+        binding,
+        visibility,
+        view_dimension,
+        TextureSampleType::Float { filterable: false },
+    )
+}
+
+fn texture_layout_typed(
+    binding: u32,
+    visibility: ShaderStages,
+    view_dimension: TextureViewDimension,
+    sample_type: TextureSampleType,
+) -> BindGroupLayoutEntry {
     BindGroupLayoutEntry {
         binding,
         visibility,
         ty: BindingType::Texture {
             view_dimension,
             multisampled: false,
-            sample_type: TextureSampleType::Float { filterable: false },
+            sample_type,
         },
         count: None,
     }

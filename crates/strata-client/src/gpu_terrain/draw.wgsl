@@ -10,6 +10,49 @@ struct RasterVertex {
     @location(4) water: vec2<f32>,
 }
 
+struct TerrainVertex { relative: vec3<f32>, surface: Surface }
+
+fn terrain_vertex(face: u32, uv: vec2<f32>) -> TerrainVertex {
+    // Canonicalize cube edges using exact chart coordinates, including all three cube corners.
+    let chart = NORMAL[face] + RIGHT[face] * (2.0 * uv.x - 1.0) + UP[face] * (2.0 * uv.y - 1.0);
+    let owner = face_of(chart);
+    let canonical_uv = vec2(dot(chart, RIGHT[owner]), dot(chart, UP[owner])) * 0.5 + 0.5;
+    let dir = direction(owner, canonical_uv);
+    let s = sample_surface(owner, canonical_uv, dir);
+    let radius_min = min(1.0, view.planet.x * 0.5);
+    let level = select(s.height, s.level, water_pass);
+    let rel = relative_on_sphere(owner, canonical_uv) + dir * max(level, radius_min - view.planet.x);
+    return TerrainVertex(rel, s);
+}
+
+fn morph_relative(tile: vec4<u32>, face: u32, point: vec2<u32>, rel: vec3<f32>) -> vec3<f32> {
+    let odd = point & vec2(1u);
+    if tile.z <= 4u || all(odd == vec2(0u)) || view.settings.w == 0u {
+        return rel;
+    }
+    let parent = tile.xy >> vec2(1u);
+    let lod = tile.z - 1u;
+    let n = view.settings.z;
+    let stride = n * 2u;
+    let local = point - parent * stride;
+    var ratio = split_ratio(face, lod, parent);
+    // Adjacent parents agree on the morph of odd samples on their shared edge.
+    // At a corner both indices are even, so there is no morph.
+    for (var axis = 0u; axis < 2u; axis++) {
+        if local[axis] == 0u || local[axis] == stride {
+            let other = adjacent_tile(face, lod, parent, axis, select(1, -1, local[axis] == 0u));
+            ratio = min(ratio, split_ratio(other.z, lod, other.xy));
+        }
+    }
+    let blend = smoothstep(1.0, 1.22, ratio);
+    if blend >= 1.0 { return rel; }
+    let scale = f32(n << tile.z);
+    // The midpoint lies on a parent-grid edge or its SW-NE triangle diagonal.
+    let a = terrain_vertex(face, vec2<f32>(point - odd) / scale).relative;
+    let b = terrain_vertex(face, vec2<f32>(point + odd) / scale).relative;
+    return mix((a + b) * 0.5, rel, blend);
+}
+
 @vertex
 fn vertex(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance: u32) -> RasterVertex {
     let tile = tiles[instance];
@@ -23,16 +66,11 @@ fn vertex(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instan
     if (grid.y == 0u && (edges & 4u) != 0u) || (grid.y == n && (edges & 8u) != 0u) {
         grid.x &= ~1u;
     }
-    let uv = vec2<f32>(tile.xy * n + grid) / f32(n << tile.z);
-    // Canonicalize cube edges using exact chart coordinates, including all three cube corners.
-    let chart = NORMAL[face] + RIGHT[face] * (2.0 * uv.x - 1.0) + UP[face] * (2.0 * uv.y - 1.0);
-    let owner = face_of(chart);
-    let canonical_uv = vec2(dot(chart, RIGHT[owner]), dot(chart, UP[owner])) * 0.5 + 0.5;
-    let dir = direction(owner, canonical_uv);
-    let s = sample_surface(owner, canonical_uv, dir);
-    let radius_min = min(1.0, view.planet.x * 0.5);
-    let level = select(s.height, s.level, water_pass);
-    let rel = relative_on_sphere(owner, canonical_uv) + dir * max(level, radius_min - view.planet.x);
+    let point = tile.xy * n + grid;
+    let uv = vec2<f32>(point) / f32(n << tile.z);
+    let base = terrain_vertex(face, uv);
+    let s = base.surface;
+    let rel = morph_relative(tile, face, point, base.relative);
     let wet = select(-max(abs(s.level - s.height), 0.01), s.level - s.height, s.kind > 0.0);
     return RasterVertex(view.clip_from_eye * vec4(rel, 1.0), uv, tile, rel, s.height, vec2(wet, s.kind));
 }
@@ -127,13 +165,38 @@ fn fragment(input: RasterVertex) -> @location(0) vec4<f32> {
     let face = input.tile.w & 7u;
     let radial = direction(face, input.uv);
     let normal = normalize(cross(dpdy(input.relative), dpdx(input.relative)));
-    let surface_normal = select(normal, radial, water_pass);
+    let footprint = max(length(dpdx(input.relative)), length(dpdy(input.relative)));
+    let earth = view.settings.w != 0u;
+    var surface_normal = select(normal, radial, water_pass);
+    if earth && !water_pass {
+        surface_normal = earth_normal(radial, footprint);
+    }
     let sun = normalize(vec3(1.0, 0.8, 0.6));
     let illumination = 0.38 + 0.9 * max(0.0, dot(sun, surface_normal));
-    let footprint = max(length(dpdx(input.relative)), length(dpdy(input.relative)));
     let grid = input.uv * f32(1u << input.tile.z);
     let edge = min(fract(grid), 1.0 - fract(grid)) / max(fwidth(grid), vec2(1e-7));
     let seam = min(input.uv, 1.0 - input.uv) / max(fwidth(input.uv), vec2(1e-7));
+    if earth && (view.settings.y & 1u) == 0u {
+        let exact = sample_surface(face, input.uv, radial);
+        let edge_width = clamp(fwidth(exact.shore) * 0.5, 0.005, 0.3);
+        var coverage = smoothstep(-edge_width, edge_width, exact.shore);
+        if exact.wet_kind == 4.0 {
+            coverage *= 1.0 - smoothstep(700.0, 3200.0, footprint);
+        }
+        let depth = exact.level - exact.height;
+        let water_light = 0.38 + 0.9 * max(0.0, dot(sun, radial));
+        let water_rgb = linear(color_water(max(0.0, depth), exact.wet_kind)) * water_light;
+        if water_pass {
+            if coverage < 0.995 { discard; }
+            return vec4(water_rgb, 1.0);
+        }
+        let slope = length(cross(surface_normal, radial));
+        let land = earth_land(exact.height, slope, macro_fields(face, input.uv));
+        let bed = mix(vec3(0.52, 0.48, 0.37), vec3(0.12, 0.16, 0.19), smoothstep(0.0, 2400.0, depth));
+        let camera_above = -dot(input.relative, radial) > depth;
+        let surface_rgb = select(linear(bed) * illumination, water_rgb, camera_above);
+        return vec4(mix(linear(land) * illumination, surface_rgb, coverage), 1.0);
+    }
     let vertex_water = input.water;
     var depth = vertex_water.x;
     var kind = select(0.0, vertex_water.y, depth > 0.0);
@@ -142,7 +205,7 @@ fn fragment(input: RasterVertex) -> @location(0) vec4<f32> {
     let cell = f32(view.settings.z << input.tile.z);
     let pixel_step = max(max(fwidth(input.uv.x), fwidth(input.uv.y)) * cell, 0.001);
     let relief = fwidth(input.height) / pixel_step;
-    if hydrology_bin(face, input.uv).y > 0u || abs(input.height) < max(20.0, 2.0 * relief) {
+    if earth || abs(input.height) < max(20.0, 2.0 * relief) {
         let exact = sample_surface(face, input.uv, radial);
         depth = exact.level - exact.height;
         kind = exact.kind;
@@ -166,7 +229,8 @@ fn fragment(input: RasterVertex) -> @location(0) vec4<f32> {
         rgb = mix(vec3(0.52, 0.48, 0.37), vec3(0.12, 0.16, 0.19), smoothstep(0.0, 2400.0, depth));
     } else {
         let slope = length(cross(surface_normal, radial));
-        rgb = color_land(input.height, slope, macro_fields(face, input.uv)) * land_grain(input.relative, footprint);
+        rgb = color_land(input.height, slope, macro_fields(face, input.uv))
+            * land_grain(input.relative, footprint);
     }
     return vec4(linear(rgb) * illumination, 1.0);
 }

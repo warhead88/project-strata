@@ -6,11 +6,12 @@ use strata_globe::{
 };
 
 use crate::earth_geography::ElevationGridSource;
+use crate::earth_water::EarthWater;
 use crate::error::TerrainError;
-use crate::hydrology_index::HydrologyIndex;
 use crate::macro_cache::{DEFAULT_MACRO_RESOLUTION, MICRO_MAX_BOUND_M, MacroCell};
 
-static EARTH_DEFAULT_LEAF_BOUNDS: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();
+type LeafBounds = (Vec<f64>, Vec<f64>);
+static EARTH_DEFAULT_LEAF_BOUNDS: OnceLock<Result<LeafBounds, TerrainError>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct MinMaxNode {
@@ -36,7 +37,7 @@ pub(crate) fn build_mip_pyramid(
     elevation_source: &ElevationGridSource,
     level_offsets: &[usize],
     total_mip_per_face: usize,
-    hydrology: &HydrologyIndex,
+    water: Option<&EarthWater>,
 ) -> Result<(Vec<MinMaxNode>, ElevationRange), TerrainError> {
     let lod_depth = u8::try_from(resolution.trailing_zeros()).unwrap_or(7);
     let n = resolution as usize;
@@ -46,20 +47,21 @@ pub(crate) fn build_mip_pyramid(
         if matches!(elevation_source, ElevationGridSource::Earth(_))
             && resolution == DEFAULT_MACRO_RESOLUTION
         {
-            let (cached_min, cached_max) = EARTH_DEFAULT_LEAF_BOUNDS.get_or_init(|| {
-                compute_leaf_dem_bounds(resolution, vertex_bounds, elevation_source)
-            });
+            let (cached_min, cached_max) = EARTH_DEFAULT_LEAF_BOUNDS
+                .get_or_init(|| {
+                    compute_leaf_dem_bounds(resolution, vertex_bounds, elevation_source, water)
+                })
+                .as_ref()
+                .map_err(Clone::clone)?;
             (cached_min, cached_max)
         } else {
-            computed_bounds = compute_leaf_dem_bounds(resolution, vertex_bounds, elevation_source);
+            computed_bounds =
+                compute_leaf_dem_bounds(resolution, vertex_bounds, elevation_source, water)?;
             (&computed_bounds.0, &computed_bounds.1)
         };
 
     let stride = n + 1;
     let face_vert_count = stride * stride;
-    let inv_n = 1.0 / f64::from(resolution);
-    let cell_half_diag_rad = (FRAC_PI_2 * inv_n) * std::f64::consts::SQRT_2 * 0.65;
-    let bucket_shift = lod_depth.saturating_sub(4);
 
     let mut mip_nodes = vec![
         MinMaxNode {
@@ -78,7 +80,6 @@ pub(crate) fn build_mip_pyramid(
         let leaf_offset = f_mip_base + level_offsets[usize::from(lod_depth)];
 
         for cy in 0..n {
-            let by = (cy >> bucket_shift).min(15);
             for cx in 0..n {
                 let dem_min = leaf_min[f_cell_base + cy * n + cx];
                 let dem_max = leaf_max[f_cell_base + cy * n + cx];
@@ -89,30 +90,12 @@ pub(crate) fn build_mip_pyramid(
                     vertices[f_vert_base + (cy + 1) * stride + cx + 1],
                 ]);
 
-                let (mut cell_min, mut cell_max) = if dem_max <= 0.0 {
+                let (cell_min, cell_max) = if water.is_some() || dem_max <= 0.0 {
                     (dem_min - 0.1, dem_max + 0.1)
                 } else {
                     let margin = f64::from(r_max) * MICRO_MAX_BOUND_M + 0.1;
                     (dem_min - margin, dem_max + margin)
                 };
-
-                let bx = (cx >> bucket_shift).min(15);
-                if hydrology.bucket_has_features(face, bx, by) {
-                    #[expect(clippy::cast_precision_loss, reason = "cx, cy <= 512, exact in f64")]
-                    let center_uv =
-                        FaceUv::clamped(((cx as f64) + 0.5) * inv_n, ((cy as f64) + 0.5) * inv_n);
-                    let cell_center = face_uv_to_unit(face, center_uv);
-                    if let Some((h_min, h_max)) = hydrology.cell_bounds_contribution(
-                        face,
-                        bx,
-                        by,
-                        cell_center,
-                        cell_half_diag_rad,
-                    ) {
-                        cell_min = cell_min.min(h_min - 0.1);
-                        cell_max = cell_max.max(h_max + 0.1);
-                    }
-                }
 
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -141,7 +124,8 @@ fn compute_leaf_dem_bounds(
     resolution: u32,
     vertex_bounds: &[(f64, f64)],
     elevation_source: &ElevationGridSource,
-) -> (Vec<f64>, Vec<f64>) {
+    water: Option<&EarthWater>,
+) -> Result<(Vec<f64>, Vec<f64>), TerrainError> {
     let n = resolution as usize;
     let face_cells = n * n;
     let mut leaf_min = vec![f64::INFINITY; 6 * face_cells];
@@ -149,8 +133,12 @@ fn compute_leaf_dem_bounds(
 
     seed_leaf_bounds_from_vertices(resolution, vertex_bounds, &mut leaf_min, &mut leaf_max);
     seed_face_edge_midpoints(resolution, elevation_source, &mut leaf_min, &mut leaf_max);
-    scatter_dem_texels_into_leaves(resolution, elevation_source, &mut leaf_min, &mut leaf_max);
-    (leaf_min, leaf_max)
+    if let Some(water) = water {
+        crate::earth_bounds::scatter(resolution, water, &mut leaf_min, &mut leaf_max)?;
+    } else {
+        scatter_dem_texels_into_leaves(resolution, elevation_source, &mut leaf_min, &mut leaf_max);
+    }
+    Ok((leaf_min, leaf_max))
 }
 
 fn seed_leaf_bounds_from_vertices(

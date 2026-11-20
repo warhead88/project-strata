@@ -1,5 +1,17 @@
-earth_relief_15m.sdem
-Source: Generic Mapping Tools (GMT) earth_relief_15m_p.grd (SRTM15+ v2.x, 15 arc-minute global relief grid, 1440x720 pixel-registered).
-Authors: Tozer, B., Sandwell, D. T., Smith, W. H. F., Olson, C., Beale, J. R., & Wessel, P. (2019). Global bathymetry and topography at 15 arc sec: SRTM15+. Earth and Space Science, 6, 1847–1864.
-License: CC-BY 4.0 / Public scientific Earth relief dataset.
-Format: Lossless 1-meter integer SDEM v1 binary stream (2D left/up predictor + byte-aligned escape i16).
+Project Strata prepared Earth surface
+
+Relief and bathymetry: NOAA National Centers for Environmental Information
+(2022). ETOPO 2022 15 Arc-Second Global Relief Model, version 1, distributed
+60 arc-second ice-surface GeoTIFF variant. DOI: 10.25921/fd45-gt74.
+https://www.ncei.noaa.gov/products/etopo-global-relief-model
+The NOAA user guide permits private, academic, and commercial use.
+https://www.ngdc.noaa.gov/mgg/global/relief/ETOPO2022/docs/1.2%20ETOPO%202022%20User%20Guide.pdf
+
+Land, islands, lakes, river/canal centrelines and marine names: Made with
+Natural Earth. 1:10m physical vectors. Public domain.
+https://www.naturalearthdata.com/downloads/10m-physical-vectors/
+https://www.naturalearthdata.com/about/terms-of-use/
+
+Project Strata derived the integer elevation grids, sampled water levels,
+synthetic channel beds and bank/valley transitions, and the sparse water
+atlas from these sources. See tools/earth/sources.sha256 for exact inputs.
