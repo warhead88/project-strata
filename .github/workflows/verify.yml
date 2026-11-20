@@ -16,8 +16,15 @@ concurrency:
 jobs:
   verify:
     runs-on: macos-15
+    env:
+      # Several workspace test executables embed the Earth archives.
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - run: df -h .
       - run: cargo verify
+      - if: always()
+        run: df -h .

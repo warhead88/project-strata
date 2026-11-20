@@ -1,19 +1,20 @@
 //! Pure-Rust planetary terrain, hydrology, climate, and biome library for Project Strata.
 //!
-//! `strata-terrain` is strictly `std` + `strata-globe` only, providing `O(1)`
+//! `strata-terrain` runs without a graphics stack and provides `O(1)`
 //! zero-allocation queries for elevation, conservative tile bounds, oceans/lakes/rivers,
 //! climate, biomes, and physical-geographic surface colors.
 
 pub mod climate;
 pub mod dem;
+mod earth_bounds;
 mod earth_data;
 mod earth_dem;
 pub mod earth_geography;
+mod earth_local;
+mod earth_pack;
+mod earth_water;
 pub mod error;
 pub mod hydrology;
-mod hydrology_builder;
-mod hydrology_data;
-mod hydrology_index;
 pub mod macro_cache;
 mod macro_climate;
 mod macro_mipmap;
@@ -32,7 +33,10 @@ mod surface_data;
 pub mod terrain_config;
 pub mod terrain_world;
 mod terrain_world_queries;
-pub use surface_data::{HYDROLOGY_BUCKET_DIM, SurfaceData, SurfaceRaster, SurfaceWaterFeature};
+mod water_catalog;
+pub use earth_local::{EARTH_LOCAL_PERIOD_M, EarthLocalRaster};
+pub use earth_water::EarthWaterRaster;
+pub use surface_data::{SurfaceData, SurfaceRaster};
 
 pub use climate::{Biome, ClimateSample, classify_biome, surface_albedo_rgb};
 pub use dem::DemGrid;

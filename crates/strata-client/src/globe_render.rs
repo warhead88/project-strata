@@ -105,7 +105,7 @@ pub(crate) fn reconcile_cpu_terrain(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    match (backend.uses_gpu(), state) {
+    match (backend.uses_prepared_draw(), state) {
         (false, None) => {
             commands.insert_resource(GlobeRenderState::initialize(&mut images, &mut materials));
         }

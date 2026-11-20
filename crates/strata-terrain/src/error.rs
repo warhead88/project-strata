@@ -85,7 +85,7 @@ impl fmt::Display for TerrainError {
                 write!(f, "non-finite DEM elevation value at index {index}")
             }
             Self::InvalidEarthDem { reason } => {
-                write!(f, "invalid embedded Earth DEM: {reason}")
+                write!(f, "invalid embedded Earth archive: {reason}")
             }
             Self::NonFiniteCoordinate => {
                 write!(f, "non-finite coordinate or terrain parameter")

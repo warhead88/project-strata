@@ -25,7 +25,7 @@ struct Leg {
 }
 
 // Waypoints are latitude, longitude (degrees) and altitude above the CPU terrain (meters).
-const FLIGHT: [Leg; 6] = [
+const FLIGHT: [Leg; 7] = [
     Leg {
         name: "orbit",
         seconds: 6.0,
@@ -68,11 +68,80 @@ const FLIGHT: [Leg; 6] = [
         to: [42.0, 51.0, 350_000.0],
         pitch_deg: 25.0,
     },
+    Leg {
+        name: "alps_slope",
+        seconds: 6.0,
+        from: [46.539, 10.124, 240.0],
+        to: [46.545, 10.124, 240.0],
+        pitch_deg: 62.0,
+    },
 ];
-const WARMUP_SECS: f64 = 4.0;
+// 285 m per physical pixel at the center of a 720-pixel, 60-degree nadir view.
+const REGIONAL_ALTITUDE_M: f64 = 177_708.4;
+const KERCH: [f64; 3] = [45.29, 36.52, REGIONAL_ALTITUDE_M];
+const KERCH_WEST: [f64; 3] = [45.15, 35.4, 230_000.0];
+const KERCH_EAST: [f64; 3] = [
+    45.43,
+    37.64,
+    (REGIONAL_ALTITUDE_M * REGIONAL_ALTITUDE_M) / 230_000.0,
+];
+const REGIONAL: [Leg; 6] = [
+    Leg {
+        name: "kerch_out",
+        seconds: 8.0,
+        from: KERCH_WEST,
+        to: KERCH_EAST,
+        pitch_deg: 0.0,
+    },
+    Leg {
+        name: "kerch_back",
+        seconds: 8.0,
+        from: KERCH_EAST,
+        to: KERCH_WEST,
+        pitch_deg: 0.0,
+    },
+    Leg {
+        name: "baikal",
+        seconds: 6.0,
+        from: [53.05, 107.13, REGIONAL_ALTITUDE_M],
+        to: [53.2, 107.7, REGIONAL_ALTITUDE_M],
+        pitch_deg: 0.0,
+    },
+    Leg {
+        name: "nile_suez",
+        seconds: 6.0,
+        from: [30.18, 31.55, REGIONAL_ALTITUDE_M],
+        to: [30.98, 32.05, REGIONAL_ALTITUDE_M],
+        pitch_deg: 0.0,
+    },
+    Leg {
+        name: "alps_regional",
+        seconds: 6.0,
+        from: [46.2, 9.7, REGIONAL_ALTITUDE_M],
+        to: [46.9, 10.54, REGIONAL_ALTITUDE_M],
+        pitch_deg: 0.0,
+    },
+    Leg {
+        name: "africa",
+        seconds: 6.0,
+        from: [-2.0, 26.0, 9_000_000.0],
+        to: [3.0, 31.0, 9_000_000.0],
+        pitch_deg: 0.0,
+    },
+];
+const STATIONARY: [Leg; 1] = [Leg {
+    name: "kerch_static",
+    seconds: 16.0,
+    from: KERCH,
+    to: KERCH,
+    pitch_deg: 0.0,
+}];
+const WARMUP_SECS: f64 = 5.0;
 
 #[derive(Resource)]
 struct Flight {
+    route: &'static [Leg],
+    measuring: bool,
     begun: Instant,
     update_started: Instant,
     previous: Option<Instant>,
@@ -87,18 +156,43 @@ pub(crate) fn window() -> Window {
     Window {
         title: "Project Strata — Terrain Flight".into(),
         resolution: WindowResolution::new(1280, 720).with_scale_factor_override(1.0),
-        present_mode: PresentMode::AutoNoVsync,
+        present_mode: PresentMode::AutoVsync,
         resizable: false,
         ..default()
     }
 }
 
-pub(crate) fn install(app: &mut App) {
+pub(crate) fn install(app: &mut App, gpu_terrain: bool, baseline: bool) {
+    println!("terrain_flight pid {}", std::process::id());
+    println!(
+        "terrain_flight renderer={} resolution=1280x720 present=AutoVsync cap_hz=60",
+        if baseline {
+            "baseline"
+        } else if gpu_terrain {
+            "gpu"
+        } else {
+            "cpu_selection"
+        },
+    );
     let now = Instant::now();
+    let route: &'static [Leg] = if std::env::args().any(|arg| arg == "--terrain-static") {
+        &STATIONARY
+    } else if std::env::args().any(|arg| arg == "--terrain-regional") {
+        &REGIONAL
+    } else {
+        &FLIGHT
+    };
+    let capture_leg = std::env::var("STRATA_FLIGHT_CAPTURE_LEG").ok();
+    let route = route
+        .iter()
+        .find(|leg| capture_leg.as_deref() == Some(leg.name))
+        .map_or(route, std::slice::from_ref);
     gpu_timing::install(app);
     app.insert_resource(WinitSettings::continuous())
         .add_plugins(RenderDiagnosticsPlugin)
         .insert_resource(Flight {
+            route,
+            measuring: false,
             begun: now,
             update_started: now,
             previous: None,
@@ -108,7 +202,7 @@ pub(crate) fn install(app: &mut App) {
             captures: std::env::var_os("STRATA_FLIGHT_CAPTURES").map(PathBuf::from),
             captured: false,
         })
-        .add_systems(First, start_update)
+        .add_systems(First, start_update.after(crate::frame_pacing::pace))
         .add_systems(
             Update,
             fly.before(crate::camera_sync::update_camera_and_origin),
@@ -126,7 +220,7 @@ fn start_update(mut flight: ResMut<Flight>) {
         elapsed = 0.0;
     }
     let previous = flight.previous.replace(now);
-    if let (Some(start), Some((index, _))) = (previous, leg_at(elapsed))
+    if let (Some(start), Some((index, _))) = (previous, leg_at(flight.route, elapsed))
         && index == flight.leg
         && elapsed >= WARMUP_SECS
     {
@@ -134,9 +228,9 @@ fn start_update(mut flight: ResMut<Flight>) {
     }
 }
 
-fn leg_at(elapsed: f64) -> Option<(usize, f64)> {
+fn leg_at(route: &[Leg], elapsed: f64) -> Option<(usize, f64)> {
     let mut position = (elapsed - WARMUP_SECS).max(0.0);
-    for (index, leg) in FLIGHT.iter().enumerate() {
+    for (index, leg) in route.iter().enumerate() {
         if position < leg.seconds {
             return Some((index, position / leg.seconds));
         }
@@ -146,8 +240,8 @@ fn leg_at(elapsed: f64) -> Option<(usize, f64)> {
 }
 
 fn pose(leg: &Leg, t: f64) -> [f64; 3] {
-    let lerp = |axis: usize| leg.from[axis] + (leg.to[axis] - leg.from[axis]) * t;
-    let altitude = (leg.from[2].ln() + (leg.to[2].ln() - leg.from[2].ln()) * t).exp();
+    let lerp = |axis: usize| (1.0 - t) * leg.from[axis] + leg.to[axis] * t;
+    let altitude = ((1.0 - t) * leg.from[2].ln() + t * leg.to[2].ln()).exp();
     [lerp(0), lerp(1), altitude.max(20.0)]
 }
 
@@ -158,7 +252,7 @@ fn fly(
     mut exit: MessageWriter<AppExit>,
 ) {
     let elapsed = (flight.update_started - flight.begun).as_secs_f64();
-    let Some((index, t)) = leg_at(elapsed) else {
+    let Some((index, t)) = leg_at(flight.route, elapsed) else {
         flight.report();
         exit.write(AppExit::Success);
         return;
@@ -167,19 +261,22 @@ fn fly(
         flight.report();
         flight.leg = index;
         flight.captured = false;
+        flight.measuring = false;
     }
-    let leg = &FLIGHT[index];
-    let [lat, lon, altitude] = pose(leg, t);
+    let leg = &flight.route[index];
+    if !flight.measuring && elapsed >= WARMUP_SECS {
+        println!("terrain_flight begin {}", leg.name);
+        flight.measuring = true;
+    }
+    let capture = t >= 0.5 && !flight.captured && flight.captures.is_some();
+    let [lat, lon, altitude] = pose(leg, if capture { 0.5 } else { t });
     camera.focus_unit = lat_lon_to_unit(lat, lon);
     camera.heading_unit = initial_north_tangent(camera.focus_unit);
     camera.altitude_meters = altitude;
     camera.target_altitude_meters = altitude;
     camera.pitch_rad = leg.pitch_deg.to_radians();
     camera.zoom_anchor = None;
-    if t >= 0.5
-        && !flight.captured
-        && let Some(dir) = &flight.captures
-    {
+    if capture && let Some(dir) = &flight.captures {
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(dir.join(format!("{}.png", leg.name))));
@@ -201,7 +298,7 @@ fn end_update(
             .saturating_duration_since(flight.begun)
             .as_secs_f64();
         if elapsed >= WARMUP_SECS
-            && let Some((leg, _)) = leg_at(elapsed)
+            && let Some((leg, _)) = leg_at(flight.route, elapsed)
             && leg == flight.leg
         {
             flight.record("camera_gpu", gpu_ms);
@@ -249,7 +346,10 @@ impl Flight {
     }
 
     fn report(&mut self) {
-        let leg = FLIGHT[self.leg].name;
+        let leg = self.route[self.leg].name;
+        if self.measuring {
+            println!("terrain_flight end {leg}");
+        }
         for (name, mut values) in std::mem::take(&mut self.samples) {
             values.sort_by(f64::total_cmp);
             let n = values.len();
@@ -267,6 +367,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn regional_route_retraces_the_same_pose_at_map_scale() {
+        let a = pose(&REGIONAL[0], 0.5);
+        let b = pose(&REGIONAL[1], 0.5);
+        for (forward, reverse) in a.into_iter().zip(b) {
+            assert!((forward - reverse).abs() < 1e-9);
+        }
+        assert!((a[2] - REGIONAL_ALTITUDE_M).abs() < 1e-9);
+    }
+
+    #[test]
     fn route_sweeps_orbit_to_ground_and_crosses_a_cube_seam() {
         assert!(pose(&FLIGHT[1], 0.0)[2] > 15e6);
         assert!((pose(&FLIGHT[1], 1.0)[2] - 20.0).abs() < 1e-6);
@@ -277,6 +387,6 @@ mod tests {
             strata_globe::CubeFace::from_dominant_axis(lat_lon_to_unit(lat, lon))
         };
         assert_ne!(face(0.0), face(1.0));
-        assert!(leg_at(100.0).is_none());
+        assert!(leg_at(&FLIGHT, 100.0).is_none());
     }
 }

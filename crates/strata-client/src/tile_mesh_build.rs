@@ -294,6 +294,18 @@ fn compute_tile_normals(
             .collect();
     }
 
+    if let Some(surface) = world.and_then(TerrainWorld::surface_data)
+        && surface.earth_water().is_some()
+    {
+        return unit_dirs
+            .iter()
+            .map(|&unit| {
+                let normal = surface.earth_shading_normal(unit, r_base).unwrap_or(unit);
+                [normal.x as f32, normal.y as f32, normal.z as f32]
+            })
+            .collect();
+    }
+
     let d_theta = (planet.cell_arc_length_meters(tile.lod) / r_base).clamp(1e-7, 0.05);
     let (sin_d, cos_d) = d_theta.sin_cos();
     let mut normals = Vec::with_capacity(unit_dirs.len());

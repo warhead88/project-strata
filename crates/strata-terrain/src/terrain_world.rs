@@ -7,14 +7,14 @@ use strata_globe::{
 use crate::climate::{Biome, ClimateSample, classify_biome, compute_climate_sample};
 use crate::earth_dem::EarthDem;
 use crate::earth_geography::{ElevationGridSource, TerrainSource};
+use crate::earth_water::{EarthWater, EarthWaterPoint};
 use crate::error::TerrainError;
 use crate::hydrology::WaterSample;
-use crate::hydrology_builder::build_hydrology_index;
-use crate::hydrology_index::HydrologyIndex;
 use crate::macro_cache::{CubeMacroCache, MacroCell, default_fallback_sample, micro_detail_fast};
 use crate::patches::{PatchId, PatchLayer, PatchReceipt, TerrainPatch, TerrainPatchKind};
 use crate::query::{RenderVertexSample, TileVertexBase, build_render_vertex_for_sample};
 use crate::terrain_config::{DEFAULT_EARTH_SEED, TerrainConfig};
+use crate::water_catalog::dem_water;
 
 /// Complete planetary terrain, hydrology, climate, geology, and patch world implementing
 /// [`strata_globe::ElevationSampler`] with `O(1)` zero-allocation point queries.
@@ -23,7 +23,7 @@ pub struct TerrainWorld {
     pub(crate) config: TerrainConfig,
     pub(crate) seed: u64,
     pub(crate) elevation_source: ElevationGridSource,
-    pub(crate) hydrology: HydrologyIndex,
+    pub(crate) earth_water: Option<Arc<EarthWater>>,
     pub(crate) macro_cache: CubeMacroCache,
     pub(crate) patches: PatchLayer,
 }
@@ -34,8 +34,7 @@ impl TerrainWorld {
     /// # Errors
     ///
     /// Returns [`TerrainError`] if `macro_resolution` is not a power of two in `16..=512`,
-    /// the planet radius is invalid, the embedded Earth DEM fails validation, or river
-    /// definitions violate invariants.
+    /// the planet radius is invalid, the embedded Earth data fails validation.
     pub fn new(config: TerrainConfig) -> Result<Self, TerrainError> {
         let radius = config.planet.radius_meters();
         if !radius.is_finite() || radius <= 0.0 {
@@ -50,18 +49,20 @@ impl TerrainWorld {
                 ElevationGridSource::CustomDem(Arc::new(grid.clone()))
             }
         };
-        let hydrology = build_hydrology_index(config.planet, &config.source)?;
+        let earth_water = matches!(config.source, TerrainSource::Earth { .. })
+            .then(EarthWater::embedded)
+            .transpose()?;
         let macro_cache = CubeMacroCache::bake(
             config.macro_resolution,
             &config.source,
             &elevation_source,
-            &hydrology,
+            earth_water.as_deref(),
         )?;
         Ok(Self {
             config,
             seed,
             elevation_source,
-            hydrology,
+            earth_water,
             macro_cache,
             patches: PatchLayer::new(),
         })
@@ -71,12 +72,11 @@ impl TerrainWorld {
     ///
     /// # Panics
     ///
-    /// Never panics in normal execution because the default resolution, embedded SDEM,
-    /// and static Earth river definitions are validated.
+    /// Never panics in normal execution because the default resolution, embedded Earth archive is validated.
     #[must_use]
     #[expect(
         clippy::expect_used,
-        reason = "default Earth config uses resolution 128, embedded SDEM, and validated Earth rivers"
+        reason = "default Earth config uses resolution 128 and the validated embedded Earth archive"
     )]
     pub fn earth_default() -> Self {
         Self::new(TerrainConfig::earth(DEFAULT_EARTH_SEED))
@@ -162,70 +162,88 @@ impl TerrainWorld {
             .has_any_underground_void(unit, self.config.planet.radius_meters())
     }
 
+    pub(crate) fn earth_local_sample(
+        &self,
+        unit: EcefMeters,
+        protection: f64,
+    ) -> (f64, EcefMeters) {
+        let t = (protection / 0.35).clamp(0.0, 1.0);
+        let dry = 1.0 - t * t * (3.0 - 2.0 * t);
+        if dry > 0.0
+            && let ElevationGridSource::Earth(dem) = &self.elevation_source
+        {
+            let (height, grade) = dem.local.sample(unit, self.planet().radius_meters());
+            return (height * dry, grade.scale(dry));
+        }
+        (0.0, EcefMeters::from_raw(0.0, 0.0, 0.0))
+    }
+
+    fn earth_height(&self, unit: EcefMeters, water: EarthWaterPoint) -> f64 {
+        let base = self.elevation_source.sample_bilinear(unit);
+        base + water.height_offset_m + self.earth_local_sample(unit, water.protection).0
+    }
+
     /// Fast elevation-only query for callers that already hold a unit direction vector
     /// (for example from [`strata_globe::face_uv_to_unit`]), skipping normalization.
     #[inline]
     #[must_use]
     pub fn sample_elevation_unit_prevalidated(&self, unit: EcefMeters) -> f64 {
-        let dem_elev = self.elevation_source.sample_bilinear(unit);
-        if dem_elev <= 0.0
-            && self.hydrology.lakes().is_empty()
-            && self.hydrology.rivers().is_empty()
-            && self.patches.is_empty()
-        {
-            return dem_elev;
+        if let Some(water) = &self.earth_water {
+            let height = self.earth_height(unit, water.sample(unit));
+            if self.patches.is_empty() {
+                return height;
+            }
+            let (face, uv) = ecef_to_face_uv_unit(unit);
+            return self.patches.apply_to_elevation_uv(
+                face,
+                uv,
+                unit,
+                self.planet().radius_meters(),
+                height,
+            );
         }
-        let (face, face_uv) = ecef_to_face_uv_unit(unit);
-        let base_elev = if dem_elev > 0.0 {
-            let roughness = self.macro_cache.sample_roughness_uv(face, face_uv);
-            dem_elev + micro_detail_fast(unit, dem_elev, roughness, self.seed)
-        } else {
-            dem_elev
-        };
-        let elev = self
-            .hydrology
-            .carve_elevation_uv(face, face_uv, unit, base_elev);
-        self.patches.apply_to_elevation_uv(
-            face,
-            face_uv,
-            unit,
-            self.config.planet.radius_meters(),
-            elev,
-        )
+        let (face, uv) = ecef_to_face_uv_unit(unit);
+        let height = self.elevation_source.sample_bilinear(unit);
+        let roughness = self.macro_cache.sample_roughness_uv(face, uv);
+        let height = height + micro_detail_fast(unit, height, roughness, self.seed);
+        self.patches
+            .apply_to_elevation_uv(face, uv, unit, self.planet().radius_meters(), height)
     }
 
-    /// Evaluates elevation, water body, and cached macro cell in a single `O(1)` zero-allocation pass.
     #[inline]
     fn sample_core(&self, unit_dir: EcefMeters) -> (f64, WaterSample, MacroCell) {
         let Ok(unit) = unit_dir.normalized() else {
-            let fallback = MacroCell::from(default_fallback_sample());
-            let (elev, water) = self
-                .hydrology
-                .carve_and_sample(EcefMeters::from_raw(0.0, 0.0, 1.0), 0.0);
-            return (elev, water, fallback);
+            return (
+                0.0,
+                dem_water(0.0),
+                MacroCell::from(default_fallback_sample()),
+            );
         };
         self.sample_core_unit(unit)
     }
 
     #[inline]
     pub(crate) fn sample_core_unit(&self, unit: EcefMeters) -> (f64, WaterSample, MacroCell) {
-        let (face, face_uv) = ecef_to_face_uv_unit(unit);
-        let cell = self.macro_cache.sample_bilinear_uv(face, face_uv);
-        let dem_elev = self.elevation_source.sample_bilinear(unit);
-        let base_elev =
-            dem_elev + micro_detail_fast(unit, dem_elev, f64::from(cell.roughness), self.seed);
-        let (elev, water) = self
-            .hydrology
-            .carve_and_sample_uv(face, face_uv, unit, base_elev);
-        let (elev, water) = self.patches.apply_to_sample_uv(
+        let (face, uv) = ecef_to_face_uv_unit(unit);
+        let cell = self.macro_cache.sample_bilinear_uv(face, uv);
+        let (height, water) = if let Some(atlas) = &self.earth_water {
+            let point = atlas.sample(unit);
+            let height = self.earth_height(unit, point);
+            (height, atlas.water(point, height))
+        } else {
+            let base = self.elevation_source.sample_bilinear(unit);
+            let height = base + micro_detail_fast(unit, base, f64::from(cell.roughness), self.seed);
+            (height, dem_water(height))
+        };
+        let (height, water) = self.patches.apply_to_sample_uv(
             face,
-            face_uv,
+            uv,
             unit,
-            self.config.planet.radius_meters(),
-            elev,
+            self.planet().radius_meters(),
+            height,
             water,
         );
-        (elev, water, cell)
+        (height, water, cell)
     }
 
     /// Samples elevation, hydrology, climate, and biome in a single `O(1)` zero-allocation pass
@@ -247,32 +265,7 @@ impl TerrainWorld {
     /// Samples the hydrological state at `unit_dir` (`O(1)`, zero heap allocations).
     #[must_use]
     pub fn sample_water(&self, unit_dir: EcefMeters) -> WaterSample {
-        let Ok(unit) = unit_dir.normalized() else {
-            return self
-                .hydrology
-                .carve_and_sample(EcefMeters::from_raw(0.0, 0.0, 1.0), 0.0)
-                .1;
-        };
-        let (face, face_uv) = ecef_to_face_uv_unit(unit);
-        let dem_elev = self.elevation_source.sample_bilinear(unit);
-        let base_elev = if dem_elev > 0.0 {
-            let roughness = self.macro_cache.sample_roughness_uv(face, face_uv);
-            dem_elev + micro_detail_fast(unit, dem_elev, roughness, self.seed)
-        } else {
-            dem_elev
-        };
-        let (elev, water) = self
-            .hydrology
-            .carve_and_sample_uv(face, face_uv, unit, base_elev);
-        let (_, water) = self.patches.apply_to_sample_uv(
-            face,
-            face_uv,
-            unit,
-            self.config.planet.radius_meters(),
-            elev,
-            water,
-        );
-        water
+        self.sample_core(unit_dir).1
     }
 
     /// Samples climate indicators at `unit_dir` (`O(1)`, zero heap allocations).

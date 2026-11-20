@@ -9,6 +9,7 @@ use crate::globe_render::GlobeRenderState;
 use crate::hud::format_hud_into;
 use crate::snapshot::{ClientWorldView, SelectedPointState};
 use crate::terrain::{TerrainElevation, sample_clamped_elevation};
+use crate::terrain_backend::TerrainBackend;
 
 /// Marker entity tracking authoritative simulation points in render space.
 #[derive(Resource, Default)]
@@ -93,6 +94,7 @@ pub fn sync_markers_and_hud(
     cam_state: Res<GlobeCameraState>,
     origin_state: Res<OriginState>,
     render_state: Option<Res<GlobeRenderState>>,
+    backend: Res<TerrainBackend>,
     debug: Res<TerrainDebug>,
     mut marker_map: ResMut<MarkerRenderMap>,
     mut marker_query: Query<(&mut Transform, &mut MeshMaterial3d<StandardMaterial>)>,
@@ -184,6 +186,7 @@ pub fn sync_markers_and_hud(
             &cam_state,
             &origin_state,
             render_state.as_deref(),
+            backend.uses_gpu(),
             terrain.world().map(std::sync::Arc::as_ref),
             selected.auto_sweep,
         );

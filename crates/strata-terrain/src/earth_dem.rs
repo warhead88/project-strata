@@ -3,128 +3,54 @@ use std::sync::{Arc, OnceLock};
 
 use strata_globe::EcefMeters;
 
+use crate::earth_local::EarthLocal;
+use crate::earth_pack::{invalid, read_rows};
 use crate::error::TerrainError;
 
-static EMBEDDED_SDEM: &[u8] = include_bytes!("../data/earth_relief_15m.sdem");
-static GLOBAL_EARTH_DEM: OnceLock<Arc<EarthDem>> = OnceLock::new();
+static RELIEF: [&[u8]; 4] = [
+    include_bytes!("../data/earth/relief-0.zst"),
+    include_bytes!("../data/earth/relief-1.zst"),
+    include_bytes!("../data/earth/relief-2.zst"),
+    include_bytes!("../data/earth/relief-3.zst"),
+];
+static GLOBAL_EARTH_DEM: OnceLock<Result<Arc<EarthDem>, TerrainError>> = OnceLock::new();
 
-const SDEM_MAGIC: &[u8; 4] = b"SDEM";
-const SDEM_VERSION: u16 = 1;
-const SDEM_HEADER_BYTES: usize = 14;
-const SDEM_ESCAPE: u8 = 0x80;
-
-/// Compact lossless 1-meter integer Earth relief grid (`1440 x 720`, 15-arcmin SRTM15+).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Pixel-centered global ETOPO 2022 relief at 60 arc seconds.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct EarthDem {
     width: usize,
     height: usize,
     elevations_m: Vec<i16>,
-    min_elev_m: i16,
-    max_elev_m: i16,
+    pub(crate) local: EarthLocal,
 }
 
 impl EarthDem {
-    /// Returns the globally cached embedded Real Earth DEM, decoding once on first call.
     pub(crate) fn global_embedded() -> Result<Arc<Self>, TerrainError> {
-        if let Some(cached) = GLOBAL_EARTH_DEM.get() {
-            return Ok(Arc::clone(cached));
-        }
-        let decoded = Arc::new(Self::decode_sdem(EMBEDDED_SDEM)?);
-        let _ = GLOBAL_EARTH_DEM.set(Arc::clone(&decoded));
-        Ok(decoded)
+        GLOBAL_EARTH_DEM
+            .get_or_init(|| Self::decode().map(Arc::new))
+            .clone()
     }
 
-    /// Decodes an SDEM v1 binary stream into an in-memory `i16` relief grid.
-    pub(crate) fn decode_sdem(bytes: &[u8]) -> Result<Self, TerrainError> {
-        if bytes.len() < SDEM_HEADER_BYTES {
-            return Err(TerrainError::InvalidEarthDem {
-                reason: "header truncated",
-            });
-        }
-        if &bytes[0..4] != SDEM_MAGIC {
-            return Err(TerrainError::InvalidEarthDem {
-                reason: "bad SDEM magic",
-            });
-        }
-        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version != SDEM_VERSION {
-            return Err(TerrainError::InvalidEarthDem {
-                reason: "unsupported SDEM version",
-            });
-        }
-        let width = usize::from(u16::from_le_bytes([bytes[6], bytes[7]]));
-        let height = usize::from(u16::from_le_bytes([bytes[8], bytes[9]]));
-        let min_elev_m = i16::from_le_bytes([bytes[10], bytes[11]]);
-        let max_elev_m = i16::from_le_bytes([bytes[12], bytes[13]]);
-
-        if width < 2 || height < 2 || min_elev_m > max_elev_m {
-            return Err(TerrainError::InvalidEarthDem {
-                reason: "invalid grid dimensions or bounds",
-            });
-        }
-
-        let total = width
-            .checked_mul(height)
-            .ok_or(TerrainError::InvalidEarthDem {
-                reason: "grid dimensions overflow",
+    fn decode() -> Result<Self, TerrainError> {
+        let (width, height) = (21_600, 10_800);
+        let mut elevations_m = Vec::with_capacity(width * height);
+        for bytes in RELIEF {
+            read_rows(bytes, 2 * width, height / RELIEF.len(), |row| {
+                let mut previous = 0_i16;
+                elevations_m.extend(row.as_chunks::<2>().0.iter().map(|&delta| {
+                    previous = previous.wrapping_add(i16::from_le_bytes(delta));
+                    previous
+                }));
             })?;
-        let mut elevations_m = vec![0_i16; total];
-        let mut pos = SDEM_HEADER_BYTES;
-
-        for r in 0..height {
-            let row_off = r * width;
-            for c in 0..width {
-                let Some(&b) = bytes.get(pos) else {
-                    return Err(TerrainError::InvalidEarthDem {
-                        reason: "unexpected EOF in payload",
-                    });
-                };
-                pos += 1;
-                let val = if b == SDEM_ESCAPE {
-                    let Some(lo) = bytes.get(pos).copied() else {
-                        return Err(TerrainError::InvalidEarthDem {
-                            reason: "truncated i16 escape",
-                        });
-                    };
-                    let Some(hi) = bytes.get(pos + 1).copied() else {
-                        return Err(TerrainError::InvalidEarthDem {
-                            reason: "truncated i16 escape",
-                        });
-                    };
-                    pos += 2;
-                    i16::from_le_bytes([lo, hi])
-                } else {
-                    let diff = i32::from(i8::from_le_bytes([b]));
-                    let pred = if r == 0 && c == 0 {
-                        0_i32
-                    } else if r == 0 {
-                        i32::from(elevations_m[c - 1])
-                    } else if c == 0 {
-                        i32::from(elevations_m[(r - 1) * width])
-                    } else {
-                        (i32::from(elevations_m[row_off + c - 1])
-                            + i32::from(elevations_m[(r - 1) * width + c]))
-                            >> 1
-                    };
-                    i16::try_from(pred + diff).map_err(|_| TerrainError::InvalidEarthDem {
-                        reason: "decoded elevation overflow",
-                    })?
-                };
-                if val < min_elev_m || val > max_elev_m {
-                    return Err(TerrainError::InvalidEarthDem {
-                        reason: "decoded elevation outside header bounds",
-                    });
-                }
-                elevations_m[row_off + c] = val;
-            }
         }
-
+        if elevations_m.len() != width * height {
+            return Err(invalid("unexpected elevation sample count"));
+        }
         Ok(Self {
             width,
             height,
             elevations_m,
-            min_elev_m,
-            max_elev_m,
+            local: EarthLocal::decode()?,
         })
     }
 
@@ -164,6 +90,33 @@ impl EarthDem {
         let top = e00 + (e10 - e00) * tx;
         let bot = e01 + (e11 - e01) * tx;
         top + (bot - top) * ty
+    }
+
+    pub(crate) fn shading_normal(
+        &self,
+        unit: EcefMeters,
+        radius_m: f64,
+        grade: EcefMeters,
+    ) -> EcefMeters {
+        let horizontal = unit.x.hypot(unit.z);
+        if horizontal < 1e-6 {
+            return unit;
+        }
+        let step = PI / 10_800.0;
+        let lat = unit.y.atan2(horizontal);
+        let lon = unit.x.atan2(unit.z);
+        let east = EcefMeters::from_raw(unit.z / horizontal, 0.0, -unit.x / horizontal);
+        let north = unit.cross(east);
+        let slope_east = (self.sample_bilinear_lat_lon(lat, lon + step)
+            - self.sample_bilinear_lat_lon(lat, lon - step))
+            / (2.0 * step * radius_m * horizontal.max(1e-4));
+        let slope_north = (self.sample_bilinear_lat_lon(lat + step, lon)
+            - self.sample_bilinear_lat_lon(lat - step, lon))
+            / (2.0 * step * radius_m);
+        let tangent_grade = grade - unit.scale(grade.dot(unit));
+        (unit - east.scale(slope_east) - north.scale(slope_north) - tangent_grade)
+            .normalized()
+            .unwrap_or(unit)
     }
 
     /// Evaluates `(bilinear_elev_m, local_relief_m, quad_min_m, quad_max_m, land_fraction)`

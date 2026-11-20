@@ -138,15 +138,15 @@ fn check_supported_replacement_and_cpu_preference(
     app.world_mut().insert_resource(TerrainBackend::new(false));
     app.update();
     assert!(!app.world().resource::<TerrainBackend>().uses_gpu());
-    assert!(terrain_state(app).active.is_none());
-    assert!(app.world().contains_resource::<GlobeRenderState>());
+    assert!(terrain_state(app).active.is_some());
+    assert!(!app.world().contains_resource::<GlobeRenderState>());
     let world = app.world_mut();
     world.resource_mut::<TerrainElevation>().set_world(changed);
     world.resource_mut::<GlobeCameraState>().planet = compatible;
     app.update();
     assert!(!app.world().resource::<TerrainBackend>().uses_gpu());
-    assert!(terrain_state(app).active.is_none());
-    assert!(terrain_state(app).resident.is_none());
+    assert!(terrain_state(app).active.is_some());
+    assert!(terrain_state(app).resident.is_some());
     Ok(())
 }
 

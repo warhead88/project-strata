@@ -8,10 +8,9 @@ use crate::earth_dem::EarthDem;
 /// Source model used to bake [`crate::CubeMacroCache`] and drive world terrain and hydrology.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TerrainSource {
-    /// Real Earth relief backed by the embedded 15-arcmin SRTM15+ DEM plus real hydrology
-    /// and seed-deterministic micro-detail on rough terrain.
+    /// Real Earth relief backed by the embedded ETOPO elevation and prepared hydrology atlas.
     Earth {
-        /// Deterministic seed for micro-detail noise.
+        /// Deterministic seed for climate and geology.
         seed: u64,
     },
     /// Externally supplied equirectangular DEM raster plugged straight into the terrain world.

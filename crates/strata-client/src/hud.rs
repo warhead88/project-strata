@@ -19,6 +19,7 @@ pub(crate) fn format_hud_into(
     cam_state: &GlobeCameraState,
     origin_state: &OriginState,
     render_state: Option<&GlobeRenderState>,
+    gpu_selected: bool,
     terrain_world: Option<&TerrainWorld>,
     auto_sweep: bool,
 ) {
@@ -43,6 +44,7 @@ pub(crate) fn format_hud_into(
         snapshot.planet.radius_meters(),
         time.ticks(),
         render_state,
+        gpu_selected,
     );
     let blend = cam_state.orbital_blend();
     let view_mode = if blend >= 0.999 {
@@ -161,6 +163,7 @@ fn write_renderer(
     radius_m: f64,
     tick: u64,
     render_state: Option<&GlobeRenderState>,
+    gpu_selected: bool,
 ) {
     let _ = write!(
         out,
@@ -179,6 +182,11 @@ fn write_renderer(
             render_state.max_lod
         );
     } else {
-        let _ = writeln!(out, "GPU terrain");
+        let label = if gpu_selected {
+            "GPU terrain"
+        } else {
+            "CPU-selected terrain"
+        };
+        let _ = writeln!(out, "{label}");
     }
 }

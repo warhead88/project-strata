@@ -3,11 +3,13 @@ mod camera_controls;
 mod camera_sync;
 mod clock;
 mod compass;
+mod frame_pacing;
 mod globe_debug;
 mod globe_materials;
 mod globe_render;
 mod gpu_terrain;
 mod hud;
+mod map_scale;
 mod markers;
 mod snapshot;
 mod terrain;
@@ -43,6 +45,12 @@ use crate::terrain_backend::{TerrainBackend, use_cpu_terrain};
 fn main() -> AppExit {
     let initial_snapshot = GlobeSnapshot::reference_earth();
     let planet = initial_snapshot.planet;
+    let load_started = std::time::Instant::now();
+    let terrain = TerrainElevation::earth_default();
+    println!(
+        "terrain_load cpu_ready_seconds={:.3}",
+        load_started.elapsed().as_secs_f64()
+    );
     let (clock_control, reader) = match start_clock(initial_snapshot) {
         Ok(clock) => clock,
         Err(error) => {
@@ -52,7 +60,6 @@ fn main() -> AppExit {
     };
     let world_view = ClientWorldView::new(reader);
     let selected = SelectedPointState::default();
-    let terrain = TerrainElevation::earth_default();
 
     let focus_dir = selected
         .active_point(world_view.snapshot())
@@ -70,6 +77,7 @@ fn main() -> AppExit {
 
     let gpu_terrain = !std::env::args().any(|arg| arg == "--cpu-terrain");
     let terrain_flight = std::env::args().any(|arg| arg == "--terrain-flight");
+    let baseline = terrain_flight && std::env::args().any(|arg| arg == "--terrain-baseline");
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
@@ -90,7 +98,6 @@ fn main() -> AppExit {
                 ..default()
             }),
     )
-    .add_plugins(TerrainRenderPlugin)
     .insert_resource(TerrainBackend::new(gpu_terrain))
     .insert_resource(ClearColor(Color::srgb(0.02, 0.03, 0.05)))
     .insert_resource(world_view)
@@ -101,12 +108,14 @@ fn main() -> AppExit {
     .insert_resource(terrain)
     .init_resource::<PointerGestureState>()
     .init_resource::<TerrainDebug>()
+    .add_systems(First, frame_pacing::pace)
     .add_systems(
         Startup,
         (
             setup_camera_and_lighting,
             setup_markers_and_hud,
             setup_compass_ui,
+            map_scale::spawn,
         ),
     )
     .add_systems(
@@ -119,15 +128,15 @@ fn main() -> AppExit {
             update_camera_and_origin,
             draw_cube_face_seams.run_if(use_cpu_terrain),
             sync_markers_and_hud,
+            map_scale::update,
         )
             .chain(),
     );
+    if !baseline {
+        app.add_plugins(TerrainRenderPlugin);
+    }
     if terrain_flight {
-        println!(
-            "terrain_flight renderer={} resolution=1280x720",
-            if gpu_terrain { "gpu" } else { "cpu" }
-        );
-        terrain_flight::install(&mut app);
+        terrain_flight::install(&mut app, gpu_terrain, baseline);
     }
     app.run()
 }

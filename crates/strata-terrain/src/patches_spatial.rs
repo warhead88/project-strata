@@ -1,6 +1,6 @@
 use strata_globe::{EcefMeters, ElevationRange, TileId};
 
-use crate::hydrology_index::closest_on_unit_segment;
+use crate::macro_climate::closest_on_unit_segment;
 use crate::macro_climate::{angular_distance, smoothstep};
 use crate::patches::PatchId;
 

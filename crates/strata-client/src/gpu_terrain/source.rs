@@ -7,27 +7,24 @@ use bevy::render::{
 };
 use bytemuck::{Pod, Zeroable, cast_slice};
 use strata_globe::{CubeFace, EcefMeters, TileId};
-use strata_terrain::{
-    HYDROLOGY_BUCKET_DIM, RiverWaypoint, Salinity, SurfaceData, SurfaceRaster, SurfaceWaterFeature,
-};
+use strata_terrain::{SurfaceData, SurfaceRaster};
+
+use super::earth_textures::EarthTextures;
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 pub(super) struct SourceSettings {
     pub(super) macro_resolution: u32,
     pub(super) second_octave_offset: u32,
-    pub(super) bucket_dim: u32,
     pub(super) pixel_centered: u32,
     pub(super) frequencies: [u32; 2],
-    pub(super) hydrology_radius_m: f32,
 }
 
 #[derive(Clone)]
 pub(super) struct SourceGpu {
     pub(super) settings: SourceSettings,
     pub(super) bounds: Buffer,
-    pub(super) buckets: Buffer,
-    pub(super) features: Buffer,
+    pub(super) earth: EarthTextures,
     pub(super) gradients: Buffer,
     pub(super) dem: TextureView,
     pub(super) climate: TextureView,
@@ -40,23 +37,31 @@ impl SourceGpu {
         data: &SurfaceData,
     ) -> Option<Self> {
         let (width, height, raster) = data.raster();
-        let width = u32::try_from(width).ok()?;
-        let height = u32::try_from(height).ok()?;
+        let (width, height, heights, earth_data) = match raster {
+            SurfaceRaster::Earth(values) => (
+                1,
+                1,
+                &[0.0][..],
+                Some((values, data.earth_water()?, data.earth_local()?)),
+            ),
+            SurfaceRaster::Dem(values) => (
+                u32::try_from(width).ok()?,
+                u32::try_from(height).ok()?,
+                values,
+                None,
+            ),
+        };
         if width.max(height) > device.limits().max_texture_dimension_2d {
             return None;
         }
-        let pixel_centered = u32::from(matches!(raster, SurfaceRaster::Earth(_)));
-        let heights = match raster {
-            SurfaceRaster::Earth(values) => values.iter().copied().map(f32::from).collect(),
-            SurfaceRaster::Dem(values) => values.to_vec(),
-        };
+        let earth = EarthTextures::upload(device, queue, earth_data)?;
         let dem = upload_texture(
             device,
             queue,
             "Terrain DEM",
             [width, height, 1],
             TextureFormat::R32Float,
-            &heights,
+            heights,
         );
         let (resolution, macro_grid) = data.macro_grid();
         let fields: Vec<_> = macro_grid
@@ -79,21 +84,29 @@ impl SourceGpu {
             &fields,
         );
         let octaves = data.detail_octaves();
-        let gradients = super::gradients::generate(device, queue, octaves);
+        let gradients = if earth_data.is_some() {
+            super::gradients::GradientLattices {
+                buffer: initialized(
+                    device,
+                    "Unused Earth noise binding",
+                    BufferUsages::STORAGE,
+                    &[0_u32],
+                ),
+                second_octave_offset: 0,
+            }
+        } else {
+            super::gradients::generate(device, queue, octaves)
+        };
         let bounds = upload_bounds(device, data, resolution);
-        let (buckets, features) = upload_hydrology(device, data);
         Some(Self {
             settings: SourceSettings {
                 macro_resolution: resolution,
                 second_octave_offset: gradients.second_octave_offset,
-                bucket_dim: u32::try_from(HYDROLOGY_BUCKET_DIM).ok()?,
-                pixel_centered,
+                pixel_centered: u32::from(earth_data.is_some()),
                 frequencies: octaves.map(|(frequency, _)| frequency),
-                hydrology_radius_m: meters_f32(data.hydrology_radius_m()),
             },
             bounds,
-            buckets,
-            features,
+            earth,
             gradients: gradients.buffer,
             dem,
             climate,
@@ -166,79 +179,6 @@ fn upload_bounds(device: &RenderDevice, data: &SurfaceData, resolution: u32) -> 
         BufferUsages::STORAGE,
         &bounds,
     )
-}
-
-fn upload_hydrology(device: &RenderDevice, data: &SurfaceData) -> (Buffer, Buffer) {
-    let mut buckets = Vec::new();
-    let mut features = Vec::new();
-    let mut offset = 0u32;
-    for face in CubeFace::ALL {
-        for y in 0..HYDROLOGY_BUCKET_DIM {
-            for x in 0..HYDROLOGY_BUCKET_DIM {
-                let mut count = 0u32;
-                let mut lakes = 0u32;
-                for feature in data.water_features(face, x, y) {
-                    count += 1;
-                    features.push(match feature {
-                        SurfaceWaterFeature::Lake(lake) => {
-                            lakes += 1;
-                            let kind = if lake.salinity == Salinity::Saline {
-                                3.0
-                            } else {
-                                2.0
-                            };
-                            [
-                                vec4_array(lake.center_unit, lake.radius_rad),
-                                [
-                                    meters_f32(lake.surface_elevation_m),
-                                    meters_f32(lake.max_depth_m),
-                                    kind,
-                                    0.0,
-                                ],
-                                [0.0; 4],
-                                [0.0; 4],
-                            ]
-                        }
-                        SurfaceWaterFeature::River(a, b) => [
-                            vec4_array(a.unit_dir, 0.0),
-                            vec4_array(b.unit_dir - a.unit_dir, 0.0),
-                            river_profile(a),
-                            river_profile(b),
-                        ],
-                    });
-                }
-                buckets.push([offset, count, lakes, 0]);
-                offset += count;
-            }
-        }
-    }
-    if features.is_empty() {
-        features.push([[0.0; 4]; 4]);
-    }
-    (
-        initialized(
-            device,
-            "Terrain hydrology bins",
-            BufferUsages::STORAGE,
-            &buckets,
-        ),
-        initialized(
-            device,
-            "Terrain lake and river profiles",
-            BufferUsages::STORAGE,
-            &features,
-        ),
-    )
-}
-
-fn river_profile(p: RiverWaypoint) -> [f32; 4] {
-    [
-        p.surface_elevation_m,
-        p.half_width_m,
-        p.channel_depth_m,
-        p.valley_half_width_m,
-    ]
-    .map(meters_f32)
 }
 
 pub(super) fn vec4_array(v: EcefMeters, w: f64) -> [f32; 4] {

@@ -31,6 +31,7 @@ pub(super) fn validate(
     let count = data[1] as usize;
     assert!(count > 6 * 256);
     assert!(data[6] > 0 && data[6] <= data[1]);
+    assert_cpu_selection(input, &frame, data[10..10 + count * 4].as_chunks::<4>().0);
     let mut leaves = HashMap::with_capacity(count);
     let mut area = [0; 6];
     let max_lod = input.camera.planet.max_lod();
@@ -120,4 +121,17 @@ fn selected_counts(
     queue.submit([encoder.finish()]);
     let counts = read::<u32>(device, &readback)?;
     Ok([counts[1], counts[6]])
+}
+
+fn assert_cpu_selection(input: &ExtractedTerrain, frame: &GpuView, gpu_tiles: &[[u32; 4]]) {
+    let mut cpu = super::super::cpu_selection::CpuSelection::default();
+    cpu.update(input, frame);
+    let mut cpu_tiles = cpu.instances;
+    cpu_tiles.sort_unstable();
+    let mut gpu_tiles = gpu_tiles.to_vec();
+    gpu_tiles.sort_unstable();
+    assert_eq!(
+        cpu_tiles, gpu_tiles,
+        "CPU traversal and GPU selection differ"
+    );
 }

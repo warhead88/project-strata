@@ -1,0 +1,11 @@
+f2f9381485a6b150f80fe21eacda20e404f88c3cd068d607572e0147e42f7e7b  crates/strata-terrain/data/earth/relief-0.zst
+9c69fd2fd6dc5e32e982128407e6ae5653921400b862fad2aca1151cff330861  crates/strata-terrain/data/earth/relief-1.zst
+8f52db36ab76a8050645741232a8fad9b41434d23d3e15471a8c66ab67397508  crates/strata-terrain/data/earth/relief-2.zst
+2e266b8556dffd782b6d6335e12c0d7222d1ff29db59af373f651f784b4880f6  crates/strata-terrain/data/earth/relief-3.zst
+b2b5a3a23567b85b1d65f1a5369b0d07843dfd3ffbfc10474588ed4de115b772  crates/strata-terrain/data/earth/relief-bounds.zst
+1fefc4a1b8fe9f6eb14edbeb329653be7698c1ac92d0748c6b4e4c77a3db6a00  crates/strata-terrain/data/earth/rivers.zst
+622257977d5d92857b2ec66b2255e13b0c4325a3328d1e924aab7beaf647848d  crates/strata-terrain/data/earth/water-index.zst
+4f90f07d938449d9861d18845ef34323a8bbc41b407e9ee7d7ceb38951b45680  crates/strata-terrain/data/earth/water-pages.zst
+4d151745a3e92f3b3a84dd114f7f49363031ba71f3ef88e3258d1e8b271952d7  crates/strata-terrain/data/earth/water.tsv
+c6d876212222e20329e2c752c007be1ab04e042b2f7416e06fd03600db93433e  crates/strata-terrain/data/earth/local-amplitudes.zst
+77cd8c73214ab85d37e487b65f95e3dd98ca5c4ae0289354b85ef1b5c186ab51  crates/strata-terrain/data/earth/local-shapes.zst

@@ -54,7 +54,8 @@ fn high_dry_himalayan_tile_produces_colored_terrain_without_water_mesh() -> Resu
 }
 
 #[test]
-fn ocean_lake_and_river_tiles_produce_stitched_water_meshes() -> Result<(), GlobeError> {
+fn ocean_lake_and_river_tiles_produce_stitched_water_meshes()
+-> Result<(), Box<dyn std::error::Error>> {
     let world = TerrainWorld::earth_default();
     let planet = world.planet();
     let coarser = CoarserEdges::NONE
@@ -64,20 +65,27 @@ fn ocean_lake_and_river_tiles_produce_stitched_water_meshes() -> Result<(), Glob
     let table = StitchedIndexTable::new(planet.grid_segments());
     assert_eq!(table.indices(coarser), expected_indices.as_slice());
 
+    let amazon = world
+        .rivers()
+        .iter()
+        .filter(|river| river.name == "Amazonas")
+        .flat_map(|river| &river.waypoints)
+        .find(|point| {
+            let water = world.sample_water(point.unit_dir);
+            matches!(water.kind, strata_terrain::WaterBodyKind::River(_)) && water.depth_m > 3.0
+        })
+        .ok_or("the baked Amazonas profile has no deep river sample")?;
+    let (river_tile, _, _) = ecef_to_tile_uv(planet, amazon.unit_dir, 13)?;
     let cases = [
         ("Pacific Ocean", tile_at(&world, 0.0, -150.0, 4)?),
         ("Lake Baikal", tile_at(&world, 53.5, 108.2, 7)?),
-        ("Amazon River", tile_at(&world, -1.8, -54.0, 10)?),
+        ("Amazon River", river_tile),
     ];
 
     for (label, tile) in cases {
         let built = build_tile_meshes(planet, tile, 0, &world, Some(&world));
         let Some(water) = built.water_mesh else {
-            return Err(GlobeError::InvalidTileCoord {
-                lod: tile.lod,
-                x: tile.x,
-                y: tile.y,
-            });
+            return Err(format!("{label} at {tile:?} has no water mesh").into());
         };
         assert_eq!(water.colors.len(), water.positions.len());
         assert_eq!(water.normals.len(), water.positions.len());

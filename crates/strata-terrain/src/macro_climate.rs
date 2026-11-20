@@ -300,3 +300,20 @@ pub(crate) fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
     let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
+
+pub(crate) fn closest_on_unit_segment(
+    p: EcefMeters,
+    a: EcefMeters,
+    b: EcefMeters,
+) -> (EcefMeters, f64) {
+    let ab = b - a;
+    let ab2 = ab.dot(ab);
+    if ab2 <= 1e-12 {
+        return (a, 0.0);
+    }
+    let s = ((p - a).dot(ab) / ab2).clamp(0.0, 1.0);
+    let raw = a + ab.scale(s);
+    let len = raw.norm();
+    let unit = if len > 0.0 { raw.scale(1.0 / len) } else { a };
+    (unit, s)
+}

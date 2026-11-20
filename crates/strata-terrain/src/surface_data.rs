@@ -1,12 +1,8 @@
-use strata_globe::{CubeFace, TileId};
+use strata_globe::{EcefMeters, TileId};
 
 use crate::earth_geography::ElevationGridSource;
-use crate::hydrology_index::BUCKET_DIM;
 use crate::macro_cache::DETAIL_OCTAVES;
-use crate::{LakeDef, MacroCell, RiverWaypoint, TerrainPatchKind, TerrainWorld};
-
-/// Hydrology bins per cube-face axis.
-pub const HYDROLOGY_BUCKET_DIM: usize = BUCKET_DIM;
+use crate::{EarthLocalRaster, EarthWaterRaster, MacroCell, TerrainPatchKind, TerrainWorld};
 
 /// Elevations in meters with rows ordered north to south and longitude wrapping at 180°.
 pub enum SurfaceRaster<'a> {
@@ -14,14 +10,6 @@ pub enum SurfaceRaster<'a> {
     Earth(&'a [i16]),
     /// Imported grid, sampled from the western edge and both poles.
     Dem(&'a [f32]),
-}
-
-/// Hydrology operations in the order used for point sampling within a bucket.
-pub enum SurfaceWaterFeature<'a> {
-    /// Lake and collar.
-    Lake(&'a LakeDef),
-    /// Endpoints of a river segment, upstream first.
-    River(RiverWaypoint, RiverWaypoint),
 }
 
 /// Borrowed inputs to surface sampling. Consumers may upload these on world changes.
@@ -48,10 +36,19 @@ impl TerrainWorld {
 }
 
 impl<'a> SurfaceData<'a> {
-    /// Returns the radius in meters used by the source world's hydrology.
+    /// Returns the prepared fine hydrology atlas for Earth.
     #[must_use]
-    pub const fn hydrology_radius_m(&self) -> f64 {
-        self.0.planet().radius_meters()
+    pub fn earth_water(&self) -> Option<EarthWaterRaster<'a>> {
+        self.0.earth_water.as_ref().map(|water| water.raster())
+    }
+
+    /// Returns the prepared landforms and their world-addressed amplitudes.
+    #[must_use]
+    pub fn earth_local(&self) -> Option<EarthLocalRaster<'a>> {
+        match &self.0.elevation_source {
+            ElevationGridSource::Earth(dem) => Some(dem.local.raster()),
+            ElevationGridSource::CustomDem(_) => None,
+        }
     }
 
     /// Returns the raster dimensions and height samples.
@@ -68,6 +65,20 @@ impl<'a> SurfaceData<'a> {
                 dem.height(),
                 SurfaceRaster::Dem(dem.elevations_m()),
             ),
+        }
+    }
+
+    /// Returns the Earth shading normal from regional relief and prepared local gradients.
+    /// The result does not depend on the resolution of the rendered mesh.
+    #[must_use]
+    pub fn earth_shading_normal(&self, unit: EcefMeters, radius_m: f64) -> Option<EcefMeters> {
+        match &self.0.elevation_source {
+            ElevationGridSource::Earth(dem) => {
+                let protection = self.0.earth_water.as_ref()?.sample(unit).protection;
+                let (_, grade) = self.0.earth_local_sample(unit, protection);
+                Some(dem.shading_normal(unit, radius_m, grade))
+            }
+            ElevationGridSource::CustomDem(_) => None,
         }
     }
 
@@ -90,39 +101,6 @@ impl<'a> SurfaceData<'a> {
         let range = self.0.macro_cache.tile_range(tile);
         [range.min_meters, range.max_meters]
     }
-
-    /// Visits the lakes followed by the river segments indexed in a valid hydrology bin.
-    pub fn water_features(
-        &self,
-        face: CubeFace,
-        x: usize,
-        y: usize,
-    ) -> impl Iterator<Item = SurfaceWaterFeature<'a>> {
-        let index = &self.0.hydrology;
-        let bucket = (x < BUCKET_DIM && y < BUCKET_DIM)
-            .then(|| {
-                index
-                    .buckets
-                    .get((face.index() * BUCKET_DIM + y) * BUCKET_DIM + x)
-            })
-            .flatten()
-            .copied()
-            .unwrap_or_default();
-        let lake = bucket.lake_start as usize;
-        let segment = bucket.seg_start as usize;
-        index.bucket_lakes[lake..lake + usize::from(bucket.lake_len)]
-            .iter()
-            .map(|&i| SurfaceWaterFeature::Lake(&index.lakes()[usize::from(i)]))
-            .chain(
-                index.bucket_segs[segment..segment + usize::from(bucket.seg_len)]
-                    .iter()
-                    .map(|entry| {
-                        let river = &index.rivers()[usize::from(entry.river_idx)];
-                        let i = usize::from(entry.seg_idx);
-                        SurfaceWaterFeature::River(river.waypoints[i], river.waypoints[i + 1])
-                    }),
-            )
-    }
 }
 
 #[cfg(test)]
@@ -137,7 +115,7 @@ mod tests {
         let source = world.surface_data();
         assert!(matches!(
             source.map(|data| data.raster()),
-            Some((1440, 720, SurfaceRaster::Earth(_)))
+            Some((21600, 10800, SurfaceRaster::Earth(_)))
         ));
         let patch = world.apply_patch(TerrainPatchKind::FlattenPad {
             center_unit: lat_lon_to_unit(47.0, 10.0),
