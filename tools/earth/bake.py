@@ -8,6 +8,7 @@ import numpy as np
 import rasterio
 import zstandard
 
+from local_relief import bake_local_relief
 from water import bake_water
 
 DEM = "ETOPO_2022_v1_60s_N90W180_surface.tif"
@@ -94,6 +95,8 @@ def main():
     write_grid(args.output, dem)
     print("Baking water", flush=True)
     bake_water(args.cache, args.output, dem)
+    print("Baking local relief", flush=True)
+    bake_local_relief(args.output, dem)
 
 
 if __name__ == "__main__":

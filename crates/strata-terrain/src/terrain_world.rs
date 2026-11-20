@@ -7,7 +7,7 @@ use strata_globe::{
 use crate::climate::{Biome, ClimateSample, classify_biome, compute_climate_sample};
 use crate::earth_dem::EarthDem;
 use crate::earth_geography::{ElevationGridSource, TerrainSource};
-use crate::earth_water::EarthWater;
+use crate::earth_water::{EarthWater, EarthWaterPoint};
 use crate::error::TerrainError;
 use crate::hydrology::WaterSample;
 use crate::macro_cache::{CubeMacroCache, MacroCell, default_fallback_sample, micro_detail_fast};
@@ -162,14 +162,34 @@ impl TerrainWorld {
             .has_any_underground_void(unit, self.config.planet.radius_meters())
     }
 
+    pub(crate) fn earth_local_sample(
+        &self,
+        unit: EcefMeters,
+        protection: f64,
+    ) -> (f64, EcefMeters) {
+        let t = (protection / 0.35).clamp(0.0, 1.0);
+        let dry = 1.0 - t * t * (3.0 - 2.0 * t);
+        if dry > 0.0
+            && let ElevationGridSource::Earth(dem) = &self.elevation_source
+        {
+            let (height, grade) = dem.local.sample(unit, self.planet().radius_meters());
+            return (height * dry, grade.scale(dry));
+        }
+        (0.0, EcefMeters::from_raw(0.0, 0.0, 0.0))
+    }
+
+    fn earth_height(&self, unit: EcefMeters, water: EarthWaterPoint) -> f64 {
+        let base = self.elevation_source.sample_bilinear(unit);
+        base + water.height_offset_m + self.earth_local_sample(unit, water.protection).0
+    }
+
     /// Fast elevation-only query for callers that already hold a unit direction vector
     /// (for example from [`strata_globe::face_uv_to_unit`]), skipping normalization.
     #[inline]
     #[must_use]
     pub fn sample_elevation_unit_prevalidated(&self, unit: EcefMeters) -> f64 {
         if let Some(water) = &self.earth_water {
-            let height =
-                self.elevation_source.sample_bilinear(unit) + water.sample(unit).height_offset_m;
+            let height = self.earth_height(unit, water.sample(unit));
             if self.patches.is_empty() {
                 return height;
             }
@@ -206,12 +226,12 @@ impl TerrainWorld {
     pub(crate) fn sample_core_unit(&self, unit: EcefMeters) -> (f64, WaterSample, MacroCell) {
         let (face, uv) = ecef_to_face_uv_unit(unit);
         let cell = self.macro_cache.sample_bilinear_uv(face, uv);
-        let base = self.elevation_source.sample_bilinear(unit);
         let (height, water) = if let Some(atlas) = &self.earth_water {
             let point = atlas.sample(unit);
-            let height = base + point.height_offset_m;
+            let height = self.earth_height(unit, point);
             (height, atlas.water(point, height))
         } else {
+            let base = self.elevation_source.sample_bilinear(unit);
             let height = base + micro_detail_fast(unit, base, f64::from(cell.roughness), self.seed);
             (height, dem_water(height))
         };

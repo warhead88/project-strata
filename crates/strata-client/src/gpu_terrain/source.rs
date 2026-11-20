@@ -38,7 +38,12 @@ impl SourceGpu {
     ) -> Option<Self> {
         let (width, height, raster) = data.raster();
         let (width, height, heights, earth_data) = match raster {
-            SurfaceRaster::Earth(values) => (1, 1, &[0.0][..], Some((values, data.earth_water()?))),
+            SurfaceRaster::Earth(values) => (
+                1,
+                1,
+                &[0.0][..],
+                Some((values, data.earth_water()?, data.earth_local()?)),
+            ),
             SurfaceRaster::Dem(values) => (
                 u32::try_from(width).ok()?,
                 u32::try_from(height).ok()?,
@@ -79,7 +84,19 @@ impl SourceGpu {
             &fields,
         );
         let octaves = data.detail_octaves();
-        let gradients = super::gradients::generate(device, queue, octaves);
+        let gradients = if earth_data.is_some() {
+            super::gradients::GradientLattices {
+                buffer: initialized(
+                    device,
+                    "Unused Earth noise binding",
+                    BufferUsages::STORAGE,
+                    &[0_u32],
+                ),
+                second_octave_offset: 0,
+            }
+        } else {
+            super::gradients::generate(device, queue, octaves)
+        };
         let bounds = upload_bounds(device, data, resolution);
         Some(Self {
             settings: SourceSettings {

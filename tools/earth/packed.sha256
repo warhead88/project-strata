@@ -7,3 +7,5 @@ b2b5a3a23567b85b1d65f1a5369b0d07843dfd3ffbfc10474588ed4de115b772  crates/strata-
 622257977d5d92857b2ec66b2255e13b0c4325a3328d1e924aab7beaf647848d  crates/strata-terrain/data/earth/water-index.zst
 4f90f07d938449d9861d18845ef34323a8bbc41b407e9ee7d7ceb38951b45680  crates/strata-terrain/data/earth/water-pages.zst
 4d151745a3e92f3b3a84dd114f7f49363031ba71f3ef88e3258d1e8b271952d7  crates/strata-terrain/data/earth/water.tsv
+c6d876212222e20329e2c752c007be1ab04e042b2f7416e06fd03600db93433e  crates/strata-terrain/data/earth/local-amplitudes.zst
+77cd8c73214ab85d37e487b65f95e3dd98ca5c4ae0289354b85ef1b5c186ab51  crates/strata-terrain/data/earth/local-shapes.zst

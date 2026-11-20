@@ -3,6 +3,7 @@ use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use strata_globe::{CubeFace, EcefMeters};
 
 use crate::TerrainError;
+use crate::earth_local::MAX_DISPLACEMENT_M;
 use crate::earth_pack::read_rows;
 use crate::earth_water::{EarthWater, INDEX_HEIGHT, INDEX_WIDTH};
 
@@ -46,10 +47,10 @@ pub(crate) fn scatter(
                 .fold((0, 0, i16::MIN), |(lo, hi, level), (a, b, c)| {
                     (lo.min(a), hi.max(b), level.max(c))
                 });
-            let min_m = base_min + f64::from(offset_min);
+            let min_m = base_min + f64::from(offset_min) - MAX_DISPLACEMENT_M;
             // Both renderers add the sea-level shell for culling. Keep abyssal
             // tile bounds tight and extend only for positive inland water levels.
-            let bed_max = base_max + f64::from(offset_max);
+            let bed_max = base_max + f64::from(offset_max) + MAX_DISPLACEMENT_M;
             let max_m = if water_max > 0 {
                 bed_max.max(f64::from(water_max))
             } else {

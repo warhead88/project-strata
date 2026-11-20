@@ -32,6 +32,7 @@ struct EarthWaterPoint {
     level: f32,
     kind: f32,
     coverage: f32,
+    protection: f32,
 }
 
 fn water_texel(page: u32, local: vec2<i32>) -> vec3<f32> {
@@ -51,7 +52,7 @@ fn earth_water(uv: vec2<f32>) -> EarthWaterPoint {
         let kind = f32((entry >> 12u) & 15u);
         let level_code = entry >> 16u;
         let level = select(f32(level_code) - 16384.0, 0.0, level_code == 0u);
-        return EarthWaterPoint(0.0, level, kind, f32(kind > 0.0));
+        return EarthWaterPoint(0.0, level, kind, f32(kind > 0.0), f32(kind > 0.0));
     }
 
     let page = entry & 0x7fffffffu;
@@ -65,11 +66,13 @@ fn earth_water(uv: vec2<f32>) -> EarthWaterPoint {
         (1.0 - t.x) * t.y, t.x * t.y);
     var wet = 0.0;
     var offset = 0.0;
+    var protection = 0.0;
     var level = 0.0;
     var best = -1.0;
     var kind = 0.0;
     for (var i = 0u; i < 4u; i++) {
         offset += quad[i].x * weights[i];
+        if quad[i].x != 0.0 || quad[i].z > 0.0 { protection += weights[i]; }
         if quad[i].z > 0.0 {
             wet += weights[i];
             level += quad[i].y * weights[i];
@@ -79,7 +82,7 @@ fn earth_water(uv: vec2<f32>) -> EarthWaterPoint {
             }
         }
     }
-    return EarthWaterPoint(offset, level / max(wet, 1e-12), kind, wet);
+    return EarthWaterPoint(offset, level / max(wet, 1e-12), kind, wet, protection);
 }
 
 fn earth_point(dir: vec3<f32>) -> vec2<f32> {
@@ -87,7 +90,7 @@ fn earth_point(dir: vec3<f32>) -> vec2<f32> {
     return vec2(p.x, clamp(p.y, 0.0, RELIEF_SIZE.y - 1.0));
 }
 
-fn earth_normal(dir: vec3<f32>, footprint_m: f32) -> vec3<f32> {
+fn earth_normal(dir: vec3<f32>, footprint_m: f32, grade: vec3<f32>) -> vec3<f32> {
     let p = earth_point(dir);
     let east_length = length(dir.xz);
     let east = vec3(dir.z, 0.0, -dir.x) / max(east_length, 1e-6);
@@ -99,7 +102,8 @@ fn earth_normal(dir: vec3<f32>, footprint_m: f32) -> vec3<f32> {
     let slope_y = (earth_relief(p + vec2(0.0, 1.0)) - earth_relief(p - vec2(0.0, 1.0))) * scale;
     // Derivatives of the immutable DEM are independent of the triangulation/selection.
     let weight = 1.0 - smoothstep(meters_per_texel * 0.5, meters_per_texel * 2.0, footprint_m);
-    return normalize(dir - (east * slope_x - north * slope_y) * weight);
+    let tangent_grade = grade - dir * dot(grade, dir);
+    return normalize(dir - (east * slope_x - north * slope_y) * weight - tangent_grade);
 }
 
 fn earth_land(height: f32, slope: f32, fields: vec4<f32>) -> vec3<f32> {

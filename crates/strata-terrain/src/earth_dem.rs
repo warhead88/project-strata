@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use strata_globe::EcefMeters;
 
+use crate::earth_local::EarthLocal;
 use crate::earth_pack::{invalid, read_rows};
 use crate::error::TerrainError;
 
@@ -15,11 +16,12 @@ static RELIEF: [&[u8]; 4] = [
 static GLOBAL_EARTH_DEM: OnceLock<Result<Arc<EarthDem>, TerrainError>> = OnceLock::new();
 
 /// Pixel-centered global ETOPO 2022 relief at 60 arc seconds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct EarthDem {
     width: usize,
     height: usize,
     elevations_m: Vec<i16>,
+    pub(crate) local: EarthLocal,
 }
 
 impl EarthDem {
@@ -48,6 +50,7 @@ impl EarthDem {
             width,
             height,
             elevations_m,
+            local: EarthLocal::decode()?,
         })
     }
 
@@ -89,7 +92,12 @@ impl EarthDem {
         top + (bot - top) * ty
     }
 
-    pub(crate) fn shading_normal(&self, unit: EcefMeters, radius_m: f64) -> EcefMeters {
+    pub(crate) fn shading_normal(
+        &self,
+        unit: EcefMeters,
+        radius_m: f64,
+        grade: EcefMeters,
+    ) -> EcefMeters {
         let horizontal = unit.x.hypot(unit.z);
         if horizontal < 1e-6 {
             return unit;
@@ -105,7 +113,8 @@ impl EarthDem {
         let slope_north = (self.sample_bilinear_lat_lon(lat + step, lon)
             - self.sample_bilinear_lat_lon(lat - step, lon))
             / (2.0 * step * radius_m);
-        (unit - east.scale(slope_east) - north.scale(slope_north))
+        let tangent_grade = grade - unit.scale(grade.dot(unit));
+        (unit - east.scale(slope_east) - north.scale(slope_north) - tangent_grade)
             .normalized()
             .unwrap_or(unit)
     }

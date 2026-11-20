@@ -8,9 +8,10 @@ struct RasterVertex {
     @location(2) relative: vec3<f32>,
     @location(3) height: f32,
     @location(4) water: vec2<f32>,
+    @location(5) sphere_relative: vec3<f32>,
 }
 
-struct TerrainVertex { relative: vec3<f32>, surface: Surface }
+struct TerrainVertex { relative: vec3<f32>, surface: Surface, sphere_relative: vec3<f32> }
 
 fn terrain_vertex(face: u32, uv: vec2<f32>) -> TerrainVertex {
     // Canonicalize cube edges using exact chart coordinates, including all three cube corners.
@@ -18,17 +19,28 @@ fn terrain_vertex(face: u32, uv: vec2<f32>) -> TerrainVertex {
     let owner = face_of(chart);
     let canonical_uv = vec2(dot(chart, RIGHT[owner]), dot(chart, UP[owner])) * 0.5 + 0.5;
     let dir = direction(owner, canonical_uv);
-    let s = sample_surface(owner, canonical_uv, dir);
+    let sphere_relative = relative_on_sphere(owner, canonical_uv);
+    var s: Surface;
+    if view.settings.w != 0u {
+        if water_pass {
+            let water = earth_water(earth_uv(dir));
+            s = earth_surface(earth_relief(earth_point(dir)) + water.offset, water);
+        } else {
+            s = earth_vertex(dir, sphere_relative, true);
+        }
+    } else {
+        s = sample_surface(owner, canonical_uv, dir);
+    }
     let radius_min = min(1.0, view.planet.x * 0.5);
     let level = select(s.height, s.level, water_pass);
-    let rel = relative_on_sphere(owner, canonical_uv) + dir * max(level, radius_min - view.planet.x);
-    return TerrainVertex(rel, s);
+    let rel = sphere_relative + dir * max(level, radius_min - view.planet.x);
+    return TerrainVertex(rel, s, sphere_relative);
 }
 
-fn morph_relative(tile: vec4<u32>, face: u32, point: vec2<u32>, rel: vec3<f32>) -> vec3<f32> {
+fn morph_vertex(tile: vec4<u32>, face: u32, point: vec2<u32>, base: TerrainVertex, stitched: bool) -> TerrainVertex {
     let odd = point & vec2(1u);
-    if tile.z <= 4u || all(odd == vec2(0u)) || view.settings.w == 0u {
-        return rel;
+    if all(odd == vec2(0u)) || (!stitched && (tile.z <= 4u || view.settings.w == 0u)) {
+        return base;
     }
     let parent = tile.xy >> vec2(1u);
     let lod = tile.z - 1u;
@@ -44,35 +56,44 @@ fn morph_relative(tile: vec4<u32>, face: u32, point: vec2<u32>, rel: vec3<f32>) 
             ratio = min(ratio, split_ratio(other.z, lod, other.xy));
         }
     }
-    let blend = smoothstep(1.0, 1.22, ratio);
-    if blend >= 1.0 { return rel; }
+    let blend = select(smoothstep(1.0, 1.22, ratio), 0.0, stitched);
+    if blend >= 1.0 { return base; }
     let scale = f32(n << tile.z);
     // The midpoint lies on a parent-grid edge or its SW-NE triangle diagonal.
-    let a = terrain_vertex(face, vec2<f32>(point - odd) / scale).relative;
-    let b = terrain_vertex(face, vec2<f32>(point + odd) / scale).relative;
-    return mix((a + b) * 0.5, rel, blend);
+    let a = terrain_vertex(face, vec2<f32>(point - odd) / scale);
+    let b = terrain_vertex(face, vec2<f32>(point + odd) / scale);
+    return TerrainVertex(
+        mix((a.relative + b.relative) * 0.5, base.relative, blend), base.surface,
+        mix((a.sphere_relative + b.sphere_relative) * 0.5, base.sphere_relative, blend)
+    );
 }
 
-@vertex
-fn vertex(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance: u32) -> RasterVertex {
-    let tile = tiles[instance];
+fn raster_vertex(tile: vec4<u32>, vertex_id: u32) -> RasterVertex {
     let face = tile.w & 7u;
     let edges = tile.w >> 3u;
     let n = view.settings.z;
     var grid = vec2(vertex_id % (n + 1u), vertex_id / (n + 1u));
-    if (grid.x == 0u && (edges & 1u) != 0u) || (grid.x == n && (edges & 2u) != 0u) {
-        grid.y &= ~1u;
-    }
-    if (grid.y == 0u && (edges & 4u) != 0u) || (grid.y == n && (edges & 8u) != 0u) {
-        grid.x &= ~1u;
+    let stitched = (grid.x == 0u && (edges & 1u) != 0u)
+        || (grid.x == n && (edges & 2u) != 0u)
+        || (grid.y == 0u && (edges & 4u) != 0u)
+        || (grid.y == n && (edges & 8u) != 0u);
+    // Earth keeps the parameterization of the parent triangles even along a stitched
+    // edge. An odd boundary point goes to the segment midpoint, not an endpoint.
+    if view.settings.w == 0u && stitched {
+        grid &= vec2(~1u);
     }
     let point = tile.xy * n + grid;
     let uv = vec2<f32>(point) / f32(n << tile.z);
-    let base = terrain_vertex(face, uv);
+    let base = morph_vertex(tile, face, point, terrain_vertex(face, uv), stitched);
     let s = base.surface;
-    let rel = morph_relative(tile, face, point, base.relative);
+    let rel = base.relative;
     let wet = select(-max(abs(s.level - s.height), 0.01), s.level - s.height, s.kind > 0.0);
-    return RasterVertex(view.clip_from_eye * vec4(rel, 1.0), uv, tile, rel, s.height, vec2(wet, s.kind));
+    return RasterVertex(view.clip_from_eye * vec4(rel, 1.0), uv, tile, rel, s.height, vec2(wet, s.kind), base.sphere_relative);
+}
+
+@vertex
+fn vertex(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance: u32) -> RasterVertex {
+    return raster_vertex(tiles[instance], vertex_id);
 }
 
 fn linear(rgb: vec3<f32>) -> vec3<f32> {
@@ -168,16 +189,27 @@ fn fragment(input: RasterVertex) -> @location(0) vec4<f32> {
     let footprint = max(length(dpdx(input.relative)), length(dpdy(input.relative)));
     let earth = view.settings.w != 0u;
     var surface_normal = select(normal, radial, water_pass);
-    if earth && !water_pass {
-        surface_normal = earth_normal(radial, footprint);
-    }
+
     let sun = normalize(vec3(1.0, 0.8, 0.6));
-    let illumination = 0.38 + 0.9 * max(0.0, dot(sun, surface_normal));
+    var illumination = 0.38 + 0.9 * max(0.0, dot(sun, surface_normal));
     let grid = input.uv * f32(1u << input.tile.z);
     let edge = min(fract(grid), 1.0 - fract(grid)) / max(fwidth(grid), vec2(1e-7));
     let seam = min(input.uv, 1.0 - input.uv) / max(fwidth(input.uv), vec2(1e-7));
     if earth && (view.settings.y & 1u) == 0u {
-        let exact = sample_surface(face, input.uv, radial);
+        let uv = earth_uv(radial);
+        let water = earth_water(uv);
+        let base = earth_relief(earth_point(radial)) + water.offset;
+        let p = local_position(input.sphere_relative);
+        var local = LocalRelief(0.0, vec3(0.0), 0.0);
+        if !water_pass {
+            let bands = 1.0 - smoothstep(vec2(8.0, 0.60), vec2(26.0, 2.8), vec2(footprint));
+            local = local_relief(uv, p, radial, dry_weight(water), bands);
+            let material = earth_ground_material(p, radial, footprint);
+            surface_normal = earth_normal(radial, footprint, local.grade + material.grade);
+            local.material += material.material;
+            illumination = 0.38 + 0.9 * max(0.0, dot(sun, surface_normal));
+        }
+        let exact = earth_surface(base + local.height, water);
         let edge_width = clamp(fwidth(exact.shore) * 0.5, 0.005, 0.3);
         var coverage = smoothstep(-edge_width, edge_width, exact.shore);
         if exact.wet_kind == 4.0 {
@@ -191,7 +223,7 @@ fn fragment(input: RasterVertex) -> @location(0) vec4<f32> {
             return vec4(water_rgb, 1.0);
         }
         let slope = length(cross(surface_normal, radial));
-        let land = earth_land(exact.height, slope, macro_fields(face, input.uv));
+        let land = earth_land(exact.height, slope, macro_fields(face, input.uv)) * (1.0 + local.material);
         let bed = mix(vec3(0.52, 0.48, 0.37), vec3(0.12, 0.16, 0.19), smoothstep(0.0, 2400.0, depth));
         let camera_above = -dot(input.relative, radial) > depth;
         let surface_rgb = select(linear(bed) * illumination, water_rgb, camera_above);
@@ -205,7 +237,7 @@ fn fragment(input: RasterVertex) -> @location(0) vec4<f32> {
     let cell = f32(view.settings.z << input.tile.z);
     let pixel_step = max(max(fwidth(input.uv.x), fwidth(input.uv.y)) * cell, 0.001);
     let relief = fwidth(input.height) / pixel_step;
-    if earth || abs(input.height) < max(20.0, 2.0 * relief) {
+    if !earth && abs(input.height) < max(20.0, 2.0 * relief) {
         let exact = sample_surface(face, input.uv, radial);
         depth = exact.level - exact.height;
         kind = exact.kind;

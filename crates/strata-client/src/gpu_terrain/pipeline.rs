@@ -6,8 +6,9 @@ use bevy::render::{
         ComputePipeline, DepthBiasState, DepthStencilState, Face, MultisampleState,
         PipelineCompilationOptions, PipelineLayout, PipelineLayoutDescriptor, PrimitiveState,
         RawComputePipelineDescriptor, RawFragmentState, RawRenderPipelineDescriptor,
-        RawVertexState, RenderPipeline, ShaderModule, ShaderModuleDescriptor, ShaderSource,
-        ShaderStages, StencilState, TextureFormat, TextureSampleType, TextureViewDimension,
+        RawVertexState, RenderPipeline, SamplerBindingType, ShaderModule, ShaderModuleDescriptor,
+        ShaderSource, ShaderStages, StencilState, TextureFormat, TextureSampleType,
+        TextureViewDimension,
     },
     renderer::RenderDevice,
 };
@@ -17,6 +18,7 @@ use super::source::SourceGpu;
 pub(super) const CUBE: &str = include_str!("cube.wgsl");
 const SELECT: &str = include_str!("select.wgsl");
 pub(super) const EARTH: &str = include_str!("earth_surface.wgsl");
+pub(super) const LOCAL: &str = include_str!("earth_local.wgsl");
 pub(super) const SURFACE: &str = include_str!("surface.wgsl");
 pub(super) const DRAW: &str = include_str!("draw.wgsl");
 
@@ -108,7 +110,7 @@ impl DrawPipelines {
         let shader = shader(
             device,
             "Terrain surface WGSL",
-            &[CUBE, EARTH, SURFACE, DRAW],
+            &[CUBE, EARTH, LOCAL, SURFACE, DRAW],
         );
         let layout = pipeline_layout(device, &world_layout, &tile_layout);
         Self {
@@ -201,6 +203,20 @@ pub(super) fn surface_group(
             TextureViewDimension::D2Array,
             TextureSampleType::Sint,
         ),
+        texture_layout_typed(
+            7,
+            stage,
+            TextureViewDimension::D2,
+            TextureSampleType::Float { filterable: true },
+        ),
+        texture_layout_typed(
+            8,
+            stage,
+            TextureViewDimension::D2Array,
+            TextureSampleType::Float { filterable: true },
+        ),
+        sampler_layout(9, stage),
+        sampler_layout(10, stage),
     ];
     let world_layout = device.create_bind_group_layout("Terrain draw inputs", &bindings);
     let world = device.create_bind_group(
@@ -214,6 +230,10 @@ pub(super) fn surface_group(
             entry(4, BindingResource::TextureView(&source.earth.relief)),
             entry(5, BindingResource::TextureView(&source.earth.directory)),
             entry(6, BindingResource::TextureView(&source.earth.pages)),
+            entry(7, BindingResource::TextureView(&source.earth.amplitudes)),
+            entry(8, BindingResource::TextureView(&source.earth.shapes)),
+            entry(9, BindingResource::Sampler(&source.earth.amplitude_sampler)),
+            entry(10, BindingResource::Sampler(&source.earth.shape_sampler)),
         ],
     );
     (world_layout, world)
@@ -254,6 +274,15 @@ pub(super) fn storage_group<const N: usize>(
 
 fn entry(binding: u32, resource: BindingResource<'_>) -> BindGroupEntry<'_> {
     BindGroupEntry { binding, resource }
+}
+
+fn sampler_layout(binding: u32, visibility: ShaderStages) -> BindGroupLayoutEntry {
+    BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+        count: None,
+    }
 }
 
 fn buffer_layout(

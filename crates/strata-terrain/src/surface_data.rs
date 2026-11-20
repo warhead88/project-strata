@@ -2,7 +2,7 @@ use strata_globe::{EcefMeters, TileId};
 
 use crate::earth_geography::ElevationGridSource;
 use crate::macro_cache::DETAIL_OCTAVES;
-use crate::{EarthWaterRaster, MacroCell, TerrainPatchKind, TerrainWorld};
+use crate::{EarthLocalRaster, EarthWaterRaster, MacroCell, TerrainPatchKind, TerrainWorld};
 
 /// Elevations in meters with rows ordered north to south and longitude wrapping at 180°.
 pub enum SurfaceRaster<'a> {
@@ -42,6 +42,15 @@ impl<'a> SurfaceData<'a> {
         self.0.earth_water.as_ref().map(|water| water.raster())
     }
 
+    /// Returns the prepared landforms and their world-addressed amplitudes.
+    #[must_use]
+    pub fn earth_local(&self) -> Option<EarthLocalRaster<'a>> {
+        match &self.0.elevation_source {
+            ElevationGridSource::Earth(dem) => Some(dem.local.raster()),
+            ElevationGridSource::CustomDem(_) => None,
+        }
+    }
+
     /// Returns the raster dimensions and height samples.
     #[must_use]
     pub fn raster(&self) -> (usize, usize, SurfaceRaster<'a>) {
@@ -59,12 +68,16 @@ impl<'a> SurfaceData<'a> {
         }
     }
 
-    /// Returns the Earth shading normal from fixed one-arcminute relief differences.
+    /// Returns the Earth shading normal from regional relief and prepared local gradients.
     /// The result does not depend on the resolution of the rendered mesh.
     #[must_use]
     pub fn earth_shading_normal(&self, unit: EcefMeters, radius_m: f64) -> Option<EcefMeters> {
         match &self.0.elevation_source {
-            ElevationGridSource::Earth(dem) => Some(dem.shading_normal(unit, radius_m)),
+            ElevationGridSource::Earth(dem) => {
+                let protection = self.0.earth_water.as_ref()?.sample(unit).protection;
+                let (_, grade) = self.0.earth_local_sample(unit, protection);
+                Some(dem.shading_normal(unit, radius_m, grade))
+            }
             ElevationGridSource::CustomDem(_) => None,
         }
     }

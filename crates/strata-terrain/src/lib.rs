@@ -10,6 +10,7 @@ mod earth_bounds;
 mod earth_data;
 mod earth_dem;
 pub mod earth_geography;
+mod earth_local;
 mod earth_pack;
 mod earth_water;
 pub mod error;
@@ -33,6 +34,7 @@ pub mod terrain_config;
 pub mod terrain_world;
 mod terrain_world_queries;
 mod water_catalog;
+pub use earth_local::{EARTH_LOCAL_PERIOD_M, EarthLocalRaster};
 pub use earth_water::EarthWaterRaster;
 pub use surface_data::{SurfaceData, SurfaceRaster};
 

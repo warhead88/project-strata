@@ -41,6 +41,7 @@ pub struct EarthWaterRaster<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct EarthWaterPoint {
     pub(crate) height_offset_m: f64,
+    pub(crate) protection: f64,
     pub(crate) slot: usize,
     pub(crate) level_m: f64,
 }
@@ -147,6 +148,7 @@ impl EarthWater {
         if code & PAGE_FLAG == 0 {
             return EarthWaterPoint {
                 height_offset_m: 0.0,
+                protection: f64::from(code & 4095 != 0),
                 slot: code as usize & 4095,
                 level_m: if code >> 16 == 0 {
                     0.0
@@ -167,12 +169,16 @@ impl EarthWater {
         ];
         let mut height_offset_m = 0.0;
         let mut wet = 0.0;
+        let mut protection = 0.0;
         let mut best = -1.0;
         let mut slot = 0;
         let mut level = 0.0;
         for (cell, w) in quad.into_iter().zip(weights) {
             height_offset_m += f64::from(cell[0]) * w;
             let id = usize::from(cell[2].cast_unsigned() & 4095);
+            if id != 0 || cell[0] != 0 {
+                protection += w;
+            }
             if id != 0 {
                 wet += w;
                 level += f64::from(cell[1]) * w;
@@ -184,6 +190,7 @@ impl EarthWater {
         }
         EarthWaterPoint {
             height_offset_m,
+            protection,
             slot: if wet >= 0.5 { slot } else { 0 },
             level_m: if wet > 0.0 { level / wet } else { 0.0 },
         }

@@ -25,7 +25,7 @@ struct Leg {
 }
 
 // Waypoints are latitude, longitude (degrees) and altitude above the CPU terrain (meters).
-const FLIGHT: [Leg; 6] = [
+const FLIGHT: [Leg; 7] = [
     Leg {
         name: "orbit",
         seconds: 6.0,
@@ -67,6 +67,13 @@ const FLIGHT: [Leg; 6] = [
         from: [39.4, 49.2, 350_000.0],
         to: [42.0, 51.0, 350_000.0],
         pitch_deg: 25.0,
+    },
+    Leg {
+        name: "alps_slope",
+        seconds: 6.0,
+        from: [46.539, 10.124, 240.0],
+        to: [46.545, 10.124, 240.0],
+        pitch_deg: 62.0,
     },
 ];
 // 285 m per physical pixel at the center of a 720-pixel, 60-degree nadir view.
@@ -175,6 +182,11 @@ pub(crate) fn install(app: &mut App, gpu_terrain: bool, baseline: bool) {
     } else {
         &FLIGHT
     };
+    let capture_leg = std::env::var("STRATA_FLIGHT_CAPTURE_LEG").ok();
+    let route = route
+        .iter()
+        .find(|leg| capture_leg.as_deref() == Some(leg.name))
+        .map_or(route, std::slice::from_ref);
     gpu_timing::install(app);
     app.insert_resource(WinitSettings::continuous())
         .add_plugins(RenderDiagnosticsPlugin)

@@ -6,6 +6,7 @@ use bevy::{
 };
 use bytemuck::{Pod, Zeroable};
 use strata_globe::{CubeFace, EcefMeters, FaceUv, face_uv_to_unit};
+use strata_terrain::EARTH_LOCAL_PERIOD_M;
 
 use super::{
     ExtractedTerrain,
@@ -92,9 +93,9 @@ impl ExtractedTerrain {
             ],
             detail: [source.frequencies[1], 0, 0, 0],
             material_origin: [
-                eye.x.rem_euclid(256.0),
-                eye.y.rem_euclid(256.0),
-                eye.z.rem_euclid(256.0),
+                eye.x.rem_euclid(EARTH_LOCAL_PERIOD_M),
+                eye.y.rem_euclid(EARTH_LOCAL_PERIOD_M),
+                eye.z.rem_euclid(EARTH_LOCAL_PERIOD_M),
                 0.0,
             ]
             .map(meters_f32),

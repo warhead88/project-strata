@@ -1,4 +1,5 @@
 mod gradients;
+mod lod;
 mod selection;
 mod transition;
 
@@ -15,7 +16,9 @@ use strata_globe::{CubeFace, EcefMeters, FaceUv, ecef_to_face_uv_unit, face_uv_t
 use strata_terrain::{WaterBodyKind, lat_lon_to_unit};
 
 use super::{
-    pipeline::{CUBE, EARTH, SURFACE, pipeline_layout, shader, storage_group, surface_group},
+    pipeline::{
+        CUBE, EARTH, LOCAL, SURFACE, pipeline_layout, shader, storage_group, surface_group,
+    },
     source::meters_f32,
     view::face_anchor,
     *,
@@ -70,12 +73,14 @@ fn native_gpu_terrain_matches_world_and_stitches_balanced_selection()
     let world = input.terrain.world().ok_or("test world missing")?;
     let data = world.surface_data().ok_or("test surface missing")?;
     let source = SourceGpu::upload(&device, &queue, &data).ok_or("test upload failed")?;
+    let octaves = data.detail_octaves();
+    let imported_gradients = super::gradients::generate(&device, &queue, octaves);
     gradients::validate(
         &device,
         &queue,
-        data.detail_octaves(),
-        &source.gradients,
-        source.settings.second_octave_offset,
+        octaves,
+        &imported_gradients.buffer,
+        imported_gradients.second_octave_offset,
     )?;
     let wrapped_seed_octaves = [(3, u64::MAX - 3), (2, 0x8000_0000_ffff_ffff)];
     let wrapped = super::gradients::generate(&device, &queue, wrapped_seed_octaves);
@@ -90,6 +95,7 @@ fn native_gpu_terrain_matches_world_and_stitches_balanced_selection()
         .ok_or("terrain GPU allocation failed")?;
     validate_surface(&device, &queue, &input, &gpu)?;
     selection::validate(&device, &queue, &input, &gpu)?;
+    lod::validate(&device, &queue, &gpu)?;
     Ok(())
 }
 
@@ -167,7 +173,7 @@ fn validate_surface(
     let module = shader(
         device,
         "Terrain parity probe",
-        &[CUBE, EARTH, SURFACE, PROBE],
+        &[CUBE, EARTH, LOCAL, SURFACE, PROBE],
     );
     let layout = pipeline_layout(device, &world_layout, &probe_layout);
     let pipeline = device.create_compute_pipeline(&RawComputePipelineDescriptor {

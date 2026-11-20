@@ -68,13 +68,31 @@ fn detail_noise(dir: vec3<f32>, freq: u32, offset: u32) -> f32 {
 
 // Kind: 0 = dry, 1 = ocean, 2 = lake, 3 = saline lake, 4 = river.
 struct Surface { height: f32, level: f32, kind: f32, shore: f32, wet_kind: f32 }
+fn earth_surface(height: f32, water: EarthWaterPoint) -> Surface {
+    let kind = select(0.0, water.kind, water.coverage >= 0.5 && water.level > height);
+    let shore = min(water.coverage - 0.5, (water.level - height) / 12.0);
+    return Surface(height, water.level, kind, shore, water.kind);
+}
+
+fn dry_weight(water: EarthWaterPoint) -> f32 {
+    return 1.0 - smoothstep(0.0, 0.35, water.protection);
+}
+
+fn earth_vertex(dir: vec3<f32>, sphere_relative: vec3<f32>, filtered: bool) -> Surface {
+    let uv = earth_uv(dir);
+    let water = earth_water(uv);
+    let base = earth_relief(earth_point(dir)) + water.offset;
+    let distance_m = length(sphere_relative + dir * base);
+    // Both parent and child vertices use the same camera-continuous band limit.
+    let bands = 1.0 - smoothstep(vec2(1900.0, 75.0), vec2(5200.0, 260.0), vec2(distance_m));
+    let detail = local_relief(uv, local_position(sphere_relative), dir,
+        dry_weight(water), select(vec2(1.0), bands, filtered));
+    return earth_surface(base + detail.height, water);
+}
+
 fn sample_surface(face: u32, uv: vec2<f32>, dir: vec3<f32>) -> Surface {
     if view.settings.w != 0u {
-        let water = earth_water(earth_uv(dir));
-        let height = earth_relief(earth_point(dir)) + water.offset;
-        let kind = select(0.0, water.kind, water.coverage >= 0.5 && water.level > height);
-        let shore = min(water.coverage - 0.5, (water.level - height) / 12.0);
-        return Surface(height, water.level, kind, shore, water.kind);
+        return earth_vertex(dir, relative_on_sphere(face, uv), false);
     }
     let q = dem_quad(dir);
     var height = q.x + q.y;
